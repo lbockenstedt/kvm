@@ -165,7 +165,7 @@ class KVMControlPlane(BaseControlPlane):
             "payload": {"type": cmd_type, "data": data},
         }
         msg["signature"] = self.agent_signer.sign(msg)
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self.pending_responses[corr_id] = fut
         try:
             await ws.send(json.dumps(msg, separators=(',', ':')))
