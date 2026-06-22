@@ -2,7 +2,7 @@
 # Lab Manager — KVM Spoke Installer v1.0.0
 # Single-line install:
 #   curl -sSL https://raw.githubusercontent.com/lbockenstedt/kvm/main/install_kvm.sh \
-#     | sudo bash -s -- --hub ws://LM_HUB_IP:8765 --admin-token LM_ADMIN_TOKEN
+#     | sudo bash -s -- --hub ws://LM_HUB_IP:8765
 set -euo pipefail
 
 REPO_URL="https://github.com/lbockenstedt/kvm.git"
@@ -12,20 +12,17 @@ ENV_FILE="$INSTALL_DIR/.env"
 LOG_FILE="/var/log/lm-kvm-install.log"
 
 HUB_URL=""
-ADMIN_TOKEN=""
-
-usage() { echo "Usage: $0 --hub <ws://HUB_IP:8765> --admin-token <TOKEN>"; exit 1; }
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --hub)          HUB_URL="$2";      shift ;;
-        --admin-token)  ADMIN_TOKEN="$2";  shift ;;
-        *)              usage ;;
+        --hub)         HUB_URL="$2"; shift ;;
+        --admin-token) ;;  # deprecated
+        *)             echo "Unknown argument: $1"; exit 1 ;;
     esac
     shift
 done
 
-[[ -z "$HUB_URL" || -z "$ADMIN_TOKEN" ]] && usage
+[[ -z "$HUB_URL" ]] && { echo "Usage: $0 --hub <ws://HUB_IP:8765>"; exit 1; }
 
 echo "$(date) — KVM spoke install started" | tee -a "$LOG_FILE"
 
@@ -49,18 +46,12 @@ python3 -m venv venv
 [[ -f requirements.txt ]] && ./venv/bin/pip install -r requirements.txt -q
 
 # ── Preserve or fetch spoke secret ───────────────────────────────────────────
-if [[ -f "$ENV_FILE" ]] && grep -q "^SPOKE_SECRET=" "$ENV_FILE"; then
+if [[ -f "$ENV_FILE" ]] && grep -q "^SPOKE_SECRET=.\+" "$ENV_FILE"; then
     SPOKE_SECRET=$(grep "^SPOKE_SECRET=" "$ENV_FILE" | cut -d= -f2-)
     echo "Preserving existing SPOKE_SECRET."
 else
-    SPOKE_ID="${SERVICE_NAME}-$(hostname -s)"
-    HUB_HTTP_URL="${HUB_URL/ws:\/\//http://}"
-    HUB_HTTP_URL="${HUB_HTTP_URL/wss:\/\//https://}"
-    SPOKE_SECRET=$(curl -sf -X POST "$HUB_HTTP_URL/setup/generate-secret" \
-        -H "Content-Type: application/json" \
-        -H "X-Admin-Token: $ADMIN_TOKEN" \
-        -d "{\"spoke_id\":\"$SPOKE_ID\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['secret'])")
-    echo "Auto-registered spoke. Secret stored."
+    SPOKE_SECRET=""
+    echo "ℹ️  No pre-shared secret — spoke will connect unauthenticated and await admin approval in the LM WebUI."
 fi
 
 SPOKE_ID="${SERVICE_NAME}-$(hostname -s)"
