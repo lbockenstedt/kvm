@@ -18,11 +18,44 @@ except ImportError:
     from security.signer import MessageSigner
     from messaging.protocol import Message, MessageHeader, MessagePayload
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# Shared logging setup + a canonical local file log (contract req 6 +
+# normalization). configure_logging gives the standard format + LOG_LEVEL env;
+# log_file makes a Python FileHandler own /var/log/lm/kvm.log (the canonical
+# location the hub scans), with a local fallback for a hand-run. Mirrors pxmx.
+try:
+    from logging_setup import configure_logging
+except ImportError:
+    try:
+        from core.src.logging_setup import configure_logging
+    except ImportError:
+        _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        _DFMT = '%Y-%m-%d %H:%M:%S'
+        def configure_logging(default_level=logging.INFO, *, log_file=None, **_):
+            handlers = ([logging.FileHandler(log_file), logging.StreamHandler()]
+                        if log_file else None)
+            logging.basicConfig(level=default_level, force=True,
+                                 format=_FMT, datefmt=_DFMT, handlers=handlers)
+
+
+def _resolve_log_file(name: str):
+    """Canonical /var/log/lm/<name>.log if writable, else a local logs/ fallback,
+    else None (stderr only)."""
+    primary = f"/var/log/lm/{name}.log"
+    try:
+        os.makedirs("/var/log/lm", exist_ok=True)
+        with open(primary, "a"):
+            pass
+        return primary
+    except OSError:
+        try:
+            local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            os.makedirs(local, exist_ok=True)
+            return os.path.join(local, f"{name}.log")
+        except OSError:
+            return None
+
+
+configure_logging(log_file=_resolve_log_file("kvm"))
 logger = logging.getLogger("KVMControlPlane")
 
 

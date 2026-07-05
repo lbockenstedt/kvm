@@ -78,8 +78,9 @@ WorkingDirectory=$INSTALL_DIR/src
 ExecStart=$INSTALL_DIR/venv/bin/python3 control_plane.py --id \$SPOKE_ID --secret \$SPOKE_SECRET --hub \$HUB_URL
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/lm-kvm.log
-StandardError=append:/var/log/lm-kvm.log
+# The app now owns the canonical /var/log/lm/kvm.log via a Python FileHandler
+# (control_plane.py _resolve_log_file — the location the hub scans); stderr goes
+# to journald. No redundant append-redirect to /var/log/lm-kvm.log.
 
 [Install]
 WantedBy=multi-user.target
