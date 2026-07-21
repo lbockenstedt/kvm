@@ -154,8 +154,6 @@ class KVMControlPlane(BaseControlPlane):
                         rec["nodes"]        = data.get("nodes", {}).get("nodes", [])
                         rec["vms"]          = data.get("vms",   {}).get("vms",   [])
                         rec["agent_metrics"] = data.get("metrics", {})
-                    if "kvm" in self.modules and hasattr(self.modules["kvm"], "telemetry_cache"):
-                        self.modules["kvm"].telemetry_cache[agent_id] = data
 
                 elif msg_type == "AGENT_RESPONSE":
                     if corr_id in self.pending_responses:
