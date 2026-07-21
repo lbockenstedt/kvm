@@ -17,6 +17,53 @@ logger = logging.getLogger("KVMSpoke")
 _TELEMETRY_FRESH_SECS = 60.0
 
 
+def _norm_mac(mac: str) -> str:
+    """Normalize a MAC to lower-colon form (aa:bb:cc:dd:ee:ff).
+
+    The hub normalizes the query `q` to this form before dispatch, so we do
+    the same to VM MACs before comparing. Tolerates :, -, ., space and bare
+    hex; returns the stripped/lowered input unchanged if it isn't a MAC.
+    """
+    if not mac:
+        return ""
+    raw = mac.strip().lower()
+    hexonly = raw.replace(":", "").replace("-", "").replace(".", "").replace(" ", "")
+    if len(hexonly) == 12 and all(c in "0123456789abcdef" for c in hexonly):
+        return ":".join(hexonly[i:i + 2] for i in range(0, 12, 2))
+    return raw
+
+
+def _vm_ips(vm: Dict[str, Any]) -> List[str]:
+    """Lowercased IP strings from a VM record's `ips` list (strings or dicts)."""
+    out: List[str] = []
+    for entry in (vm.get("ips") or []):
+        if isinstance(entry, str):
+            out.append(entry.lower())
+        elif isinstance(entry, dict):
+            addr = entry.get("address") or entry.get("ip") or entry.get("addr")
+            if addr:
+                out.append(str(addr).lower())
+    return out
+
+
+def _vm_macs(vm: Dict[str, Any]) -> List[str]:
+    """Lower-colon MACs from a VM record — top-level `mac`, `interfaces`, and
+    any `ips` entry carrying a `mac` (agent shape varies)."""
+    macs: List[str] = []
+    if vm.get("mac"):
+        macs.append(_norm_mac(vm.get("mac")))
+    for iface in (vm.get("interfaces") or []):
+        if isinstance(iface, dict):
+            if iface.get("mac"):
+                macs.append(_norm_mac(iface.get("mac")))
+        elif isinstance(iface, str):
+            macs.append(_norm_mac(iface))
+    for entry in (vm.get("ips") or []):
+        if isinstance(entry, dict) and entry.get("mac"):
+            macs.append(_norm_mac(entry.get("mac")))
+    return macs
+
+
 class KVMSpoke(BaseSpoke):
     """
     KVM/libvirt hypervisor integration spoke.
@@ -162,17 +209,54 @@ class KVMSpoke(BaseSpoke):
                 "agent_count": len(self.control_plane.connected_agents)}
 
     async def _search_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        q = (data.get("q") or "").strip().lower()
-        all_r = await self._list_vms({})
-        return {
-            "status":  "SUCCESS",
-            "results": [
-                {"source": "kvm", "type": vm.get("type", "kvm"), **vm}
-                for vm in all_r.get("vms", [])
-                if q in (vm.get("name") or "").lower()
-                or q in (vm.get("unique_id") or "").lower()
-            ],
-        }
+        try:
+            q = (data.get("q") or "").strip().lower()
+            tenant_tag = (data.get("proxmox_tag") or "").strip()
+            is_admin = bool(data.get("is_admin"))
+
+            # Spoke-side scoping rule:
+            #   tenant tag present  → filter to that tenant
+            #   tag absent + admin  → unscoped (all VMs)
+            #   tag absent + !admin → EMPTY (never leak another tenant's VMs)
+            if not tenant_tag and not is_admin:
+                return {"status": "SUCCESS", "results": [], "count": 0}
+
+            list_args: Dict[str, Any] = {}
+            if tenant_tag:
+                list_args["tag_filter"] = tenant_tag
+            all_r = await self._list_vms(list_args)
+            vms = all_r.get("vms", [])
+
+            results: List[Dict[str, Any]] = []
+            for vm in vms:
+                name = (vm.get("name") or "").lower()
+                hostname = (vm.get("hostname") or vm.get("node") or "").lower()
+                ips = _vm_ips(vm)
+                macs = _vm_macs(vm)
+                if q and not (
+                    q in name
+                    or q in hostname
+                    or q in (vm.get("unique_id") or "").lower()
+                    or any(q in ip for ip in ips)
+                    or any(q in m for m in macs)
+                ):
+                    continue
+                results.append({
+                    "source":    "kvm",
+                    "type":      "vm",
+                    "id":        vm.get("vmid") or vm.get("unique_id") or "",
+                    "name":      vm.get("name") or "",
+                    "ip":        ips[0] if ips else "",
+                    "mac":       macs[0] if macs else "",
+                    "cluster":   vm.get("cluster") or vm.get("node") or "",
+                    "status":    vm.get("status") or "",
+                    "unique_id": vm.get("unique_id") or "",
+                    "agent_id":  vm.get("agent_id") or "",
+                })
+            return {"status": "SUCCESS", "results": results, "count": len(results)}
+        except Exception as e:
+            logger.exception("SEARCH_VMS failed")
+            return {"status": "ERROR", "message": str(e), "results": []}
 
     async def _get_vm_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
         if not self.control_plane:
