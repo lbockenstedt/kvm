@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lab Manager — KVM Spoke Installer v1.0.0
+# Lab Manager — KVM Spoke Installer v0.01
 # Single-line install:
 #   curl -sSL https://raw.githubusercontent.com/lbockenstedt/kvm/main/install_kvm.sh \
 #     | sudo bash -s -- --hub ws://LM_HUB_IP:8765
