@@ -19,4 +19,16 @@ curl -sSL https://raw.githubusercontent.com/lbockenstedt/kvm/main/install_kvm.sh
 | `--admin-token` | Deprecated, accepted and ignored. |
 
 This installer takes no environment overrides.
+
+### Required control-plane config
+
+The KVM control plane authenticates agents with a shared secret and fails closed
+when it is missing. Before starting the service, create `/etc/lm-kvm/config.json`
+with an `agent_secret` value shared by the agents, for example:
+
+```json
+{
+  "agent_secret": "replace-with-a-long-random-secret"
+}
+```
 <!-- INSTALLERS:END -->
