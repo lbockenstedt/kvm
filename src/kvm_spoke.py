@@ -89,6 +89,7 @@ class KVMSpoke(BaseSpoke):
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
+        """Initialize KVMSpoke with spoke identity, configuration, and control plane."""
         super().__init__(spoke_id, config)
         self.control_plane = control_plane
         # Set after a CREATE_VM/DELETE_VM so the very next _list_vms bypasses the
@@ -97,6 +98,7 @@ class KVMSpoke(BaseSpoke):
         self._force_live_query = False
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Route incoming Hub command to the appropriate KVM handler method."""
         cmd = command_type.upper()
 
         if cmd == "GET_VERSION":
@@ -130,6 +132,7 @@ class KVMSpoke(BaseSpoke):
         return {"status": "ERROR", "error": f"Unknown command: {command_type}"}
 
     def _get_agents(self) -> Dict[str, Any]:
+        """Return list of connected KVM hypervisor agents with hostname and VM count."""
         if not self.control_plane:
             return {"status": "SUCCESS", "agents": []}
         agents = [
@@ -140,6 +143,7 @@ class KVMSpoke(BaseSpoke):
         return {"status": "SUCCESS", "agents": agents}
 
     async def _get_node_stats(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Broadcast request for node statistics across all connected KVM agents."""
         if not self.control_plane or not self.control_plane.connected_agents:
             return {"status": "SUCCESS", "nodes": []}
         results = await self.control_plane.broadcast_to_agents("GET_NODE_STATS", {})
@@ -151,6 +155,7 @@ class KVMSpoke(BaseSpoke):
 
     @staticmethod
     def _shape_vm(vm: Dict[str, Any], aid: str, hostname: str) -> Dict[str, Any]:
+        """Normalize VM record dictionary into canonical Lab Manager shape."""
         name = vm.get("name", "")
         return {
             **vm,
@@ -161,6 +166,7 @@ class KVMSpoke(BaseSpoke):
         }
 
     async def _list_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Aggregate VM domains from connected agents using telemetry cache or live query."""
         if not self.control_plane or not self.control_plane.connected_agents:
             return {"status": "SUCCESS", "vms": [], "agent_count": 0}
 
@@ -209,6 +215,7 @@ class KVMSpoke(BaseSpoke):
                 "agent_count": len(self.control_plane.connected_agents)}
 
     async def _search_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Search KVM guest domains by name, hostname, unique ID, IP, or MAC."""
         try:
             q = (data.get("q") or "").strip().lower()
             tenant_tag = (data.get("proxmox_tag") or "").strip()
@@ -259,6 +266,7 @@ class KVMSpoke(BaseSpoke):
             return {"status": "ERROR", "message": str(e), "results": []}
 
     async def _get_vm_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch detailed runtime and XML configuration for a specific VM domain."""
         if not self.control_plane:
             return {"status": "ERROR", "message": "No control plane"}
         agent_id = data.get("agent_id")
@@ -269,6 +277,7 @@ class KVMSpoke(BaseSpoke):
         return await self.control_plane.send_to_agent("GET_VM_INFO", data, agent_id=agent_id)
 
     async def _create_vm(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Relay VM domain creation command to target KVM agent."""
         if not self.control_plane or not self.control_plane.connected_agents:
             return {"status": "ERROR", "message": "No agents connected"}
         agent_id = data.get("agent_id") or next(iter(self.control_plane.connected_agents))
@@ -278,6 +287,7 @@ class KVMSpoke(BaseSpoke):
         return result
 
     async def _delete_vm(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Relay VM domain destruction/undefinition command to target KVM agent."""
         if not self.control_plane or not self.control_plane.connected_agents:
             return {"status": "ERROR", "message": "No agents connected"}
         agent_id = data.get("agent_id") or next(iter(self.control_plane.connected_agents))
@@ -287,6 +297,7 @@ class KVMSpoke(BaseSpoke):
         return result
 
     async def get_status(self) -> Dict[str, Any]:
+        """Report spoke operational status and connected agent count."""
         agent_count = len(self.control_plane.connected_agents) if self.control_plane else 0
         return {
             "spoke_id":    self.spoke_id,
@@ -296,6 +307,7 @@ class KVMSpoke(BaseSpoke):
         }
 
     def get_version(self) -> str:
+        """Read and return version string from VERSION file."""
         from pathlib import Path
         try:
             return (Path(__file__).parent.parent / "VERSION").read_text().strip()
