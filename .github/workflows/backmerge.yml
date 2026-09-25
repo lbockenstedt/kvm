@@ -92,6 +92,12 @@ jobs:
           - source: qa
             target: dev
     steps:
+      - name: Note skipped leg
+        if: matrix.source != github.ref_name
+        run: |
+          echo "::notice::matrix leg ${{ matrix.source }} -> ${{ matrix.target }} skipped (pushed ref is ${{ github.ref_name }})"
+          echo "Skipped: ${{ matrix.source }} -> ${{ matrix.target }} (pushed ref is ${{ github.ref_name }})" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v4
         if: matrix.source == github.ref_name
         with:
@@ -104,7 +110,8 @@ jobs:
           if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
+            echo "::notice::target branch '${{ matrix.target }}' does not exist; skipping back-merge"
+            echo "Target branch '${{ matrix.target }}' does not exist; skipping back-merge" >> "$GITHUB_STEP_SUMMARY"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -120,6 +127,12 @@ jobs:
           git config user.name  "promote-bot[bot]"
           git config user.email "promote-bot@users.noreply.github.com"
           bash .github/scripts/promote.sh
+
+      - name: Note nothing to back-merge
+        if: steps.exists.outputs.ok == 'true' && steps.build.outputs.changed == 'false'
+        run: |
+          echo "::notice::nothing to back-merge: ${{ matrix.target }} already contains ${{ matrix.source }}"
+          echo "Nothing to back-merge: ${{ matrix.target }} already contains ${{ matrix.source }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Push back-merge branch
         if: steps.build.outputs.changed == 'true'
