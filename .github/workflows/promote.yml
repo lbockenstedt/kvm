@@ -139,7 +139,9 @@ jobs:
           # Preflight: a push carrying a .github/workflows/ change is rejected
           # outright unless the credential holds `workflow` scope. Detecting it
           # here turns an opaque git failure into an instruction.
-          if wf="$(git diff --name-only "origin/$TGT...$BR" 2>/dev/null)"; then
+          diff_err=$(mktemp)
+          if wf="$(git diff --name-only "origin/$TGT...$BR" 2>"$diff_err")"; then
+            rm -f "$diff_err"
             if printf '%s\n' "$wf" | grep -q '^\.github/workflows/'; then
               if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
                 echo "::error::This promotion changes .github/workflows/, which the Actions GITHUB_TOKEN is forbidden to push. Add a repository secret WORKFLOW_TOKEN holding a token with 'workflow' scope, then re-run. No permissions: block can grant this -- it is a GitHub platform restriction."
@@ -149,11 +151,13 @@ jobs:
               fi
             fi
           else
+            diff_reason=$(cat "$diff_err")
+            rm -f "$diff_err"
             if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
-              echo "::error::Could not diff origin/$TGT...$BR to preflight workflow changes, and no WORKFLOW_TOKEN is configured. Refusing to push without a working workflow-file preflight."
+              echo "::error::Could not diff origin/$TGT...$BR to preflight workflow changes ($diff_reason), and no WORKFLOW_TOKEN is configured. Refusing to push without a working workflow-file preflight."
               exit 1
             fi
-            echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
+            echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential ($diff_reason); attempting the push anyway"
           fi
           git push -f -q origin "$BR"
 
