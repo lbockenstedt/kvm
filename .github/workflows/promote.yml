@@ -81,10 +81,11 @@ jobs:
           #
           # TRIGGER BEHAVIOUR. A PAT push DOES start downstream workflows, where
           # a GITHUB_TOKEN push does not -- so this could recurse if the push
-          # target were a trigger branch. It is not: `on.push.branches` above is
-          # `[qa]` ONLY, and the branch pushed here is always promote/*, which
-          # matches no trigger in this workflow or in backmerge.yml. The loop is
-          # therefore closed by the trigger filter, not by the token's weakness.
+          # target were a trigger branch. It is not: this workflow triggers on
+          # `workflow_dispatch` only, and the branch pushed here is always
+          # promote/*, which matches no trigger in this workflow or in
+          # backmerge.yml. The loop is therefore closed by the trigger filter,
+          # not by the token's weakness.
           token: ${{ secrets.WORKFLOW_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Resolve source and target
@@ -148,6 +149,10 @@ jobs:
               fi
             fi
           else
+            if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
+              echo "::error::Could not diff origin/$TGT...$BR to preflight workflow changes, and no WORKFLOW_TOKEN is configured. Refusing to push without a working workflow-file preflight."
+              exit 1
+            fi
             echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
           fi
           git push -f -q origin "$BR"

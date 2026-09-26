@@ -119,7 +119,8 @@ jobs:
           # start downstream workflows. Bounded the same way: `on.push.branches`
           # above is `[main, qa]`, while every push below targets a
           # backmerge/<src>-to-<tgt> branch, which matches no trigger here or in
-          # promote.yml. This job opens a PR and never merges.
+          # promote.yml. The later merge step uses GITHUB_TOKEN so recursion is
+          # still bounded.
           token: ${{ secrets.WORKFLOW_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Check target branch exists
@@ -177,6 +178,10 @@ jobs:
               fi
             fi
           else
+            if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
+              echo "::error::Could not diff origin/$TGT...$BR to preflight workflow changes, and no WORKFLOW_TOKEN is configured. Refusing to push without a working workflow-file preflight."
+              exit 1
+            fi
             echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
           fi
           git push -f -q origin "$BR"
