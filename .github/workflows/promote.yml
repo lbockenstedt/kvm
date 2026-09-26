@@ -30,17 +30,6 @@ name: promote
 # day-to-day feedback stays automatic. Only the decision to promote is manual.
 
 on:
-  # qa advancing means the dev -> qa unit that was in flight has landed.
-  # Promotion is split one original PR at a time, so queue the next unit here.
-  # Without this the queue stalls after unit 1 and every later unit needs its
-  # own manual dispatch -- strictly worse than the old single batched PR.
-  #
-  # This does NOT reintroduce the per-commit cascade that `on: push` to dev
-  # once caused: it fires only on qa, and "Resolve source and target" pins a
-  # push-triggered run to the dev -> qa hop. A push to qa can never start
-  # anything moving toward main.
-  push:
-    branches: [qa]
   workflow_dispatch:
     inputs:
       source:
@@ -59,11 +48,8 @@ concurrency:
   # Keyed off the branch being promoted, not the ref the run was dispatched
   # from -- a manual run is always dispatched from the default branch, so
   # github.ref_name would collapse dev->qa and qa->main into one queue.
-  # Must agree with the src that "Resolve source and target" will pick, or a
-  # push-triggered run (ref_name 'qa', but promoting dev) would land in a
-  # different queue than a manual dev run and the two would force-push the
-  # same promotion branch concurrently.
-  group: promote-${{ github.event_name == 'push' && 'dev' || github.event.inputs.source || github.ref_name }}
+  # Must agree with the src that "Resolve source and target" will pick.
+  group: promote-${{ github.event.inputs.source || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -78,15 +64,7 @@ jobs:
       - name: Resolve source and target
         id: route
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            # Pinned, NOT taken from the ref. github.ref_name on this trigger is
-            # "qa", which would resolve to the qa -> main hop and auto-advance
-            # production every time a promotion landed. Queueing the next
-            # dev -> qa unit is the only thing this trigger may do.
-            src=dev
-          else
-            src="${{ github.event.inputs.source || github.ref_name }}"
-          fi
+          src="${{ github.event.inputs.source || github.ref_name }}"
           case "$src" in
             dev) tgt=qa ;;
             qa)  tgt=main ;;

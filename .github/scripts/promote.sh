@@ -170,10 +170,11 @@ if [ "$SPLIT" = "1" ]; then
     echo "remaining=$remaining"
   } >> "$out"
   # Multi-line values need the heredoc form of the step-output protocol.
+  eof_delim="PROMOTE_EOF_$(od -An -N8 -tx /dev/urandom 2>/dev/null | tr -d ' ' || echo "$$")"
   {
-    echo "unit_subject<<PROMOTE_EOF"
+    echo "unit_subject<<$eof_delim"
     echo "$unit_subject"
-    echo "PROMOTE_EOF"
+    echo "$eof_delim"
   } >> "$out"
   echo "Promoting the oldest of ${#units[@]} un-promoted unit(s): ${unit_pr:+#$unit_pr }$unit_subject"
   echo "  up to $remaining further unit(s) will follow in later runs"
