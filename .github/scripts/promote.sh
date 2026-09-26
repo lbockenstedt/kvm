@@ -63,9 +63,13 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # then silently continued as the target's older batched script and swept up
 # every remaining unit in one go. Re-exec so the running code is immutable.
 if [ -z "${PROMOTE_REEXEC:-}" ]; then
+  if [ ! -f "$here/bump_version.py" ]; then
+    echo "::error::bump_version.py not found in $here"
+    exit 1
+  fi
   PROMOTE_TMPDIR="$(mktemp -d)"
   cp "$here/promote.sh" "$PROMOTE_TMPDIR/"
-  [ -f "$here/bump_version.py" ] && cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
+  cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
   export PROMOTE_REEXEC=1 PROMOTE_TMPDIR
   exec bash "$PROMOTE_TMPDIR/promote.sh" "$@"
 fi
@@ -79,10 +83,14 @@ git rev-parse --verify "origin/$TGT" >/dev/null 2>&1 || { echo "::error::target 
 units=()
 if [ "$SPLIT" = "1" ]; then
   while IFS= read -r c; do
-    [ -n "$c" ] && units+=("$c")
+    if [ -n "$c" ]; then
+      units+=("$c")
+    fi
   done < <(git rev-list --reverse --first-parent "origin/$TGT..origin/$SRC")
 fi
-[ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
+if [ "${#units[@]}" -eq 0 ]; then
+  units=("origin/$SRC")
+fi
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op.
@@ -96,7 +104,12 @@ stage_to() {
   git checkout -q -B "$BR" "origin/$TGT"
 
   # --no-ff: the promotion is always an explicit, revertable commit.
-  git merge --no-commit --no-ff "$endpoint" || true
+  local merge_err=0
+  git merge --no-commit --no-ff "$endpoint" || merge_err=$?
+  if [ "$merge_err" -ne 0 ] && ! git ls-files -u | grep -q .; then
+    echo "::error::git merge failed without unmerged files (exit $merge_err)"
+    exit 1
+  fi
 
   # Pin VERSION to the target's lineage. Listing from the TARGET tree means a
   # VERSION file added on the source is simply never carried over.
@@ -114,6 +127,9 @@ stage_to() {
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
   if git ls-files -u | grep -q .; then
+    if [ "$SPLIT" = "1" ] && [ "$endpoint" != "origin/$SRC" ]; then
+      return 2
+    fi
     echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand:"
     git ls-files -u | awk '{print "  " $4}' | sort -u
     exit 1
@@ -128,12 +144,26 @@ stage_to() {
 picked=""
 picked_idx=0
 for i in "${!units[@]}"; do
-  if stage_to "${units[$i]}"; then
+  rc=0
+  stage_to "${units[$i]}" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
     break
+  elif [ "$rc" -eq 2 ]; then
+    echo "  split unit ${units[$i]} conflicts against $TGT -- falling back to batched merge origin/$SRC"
+    units=("origin/$SRC")
+    SPLIT=0
+    if stage_to "origin/$SRC"; then
+      picked="origin/$SRC"
+      picked_idx=0
+    fi
+    break
+  elif [ "$rc" -eq 1 ]; then
+    if [ "$SPLIT" = "1" ]; then
+      echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
+    fi
   fi
-  [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
 if [ -z "$picked" ]; then
@@ -192,7 +222,9 @@ while IFS= read -r f; do
 done < <(version_files)
 
 subject="$LABEL: $SRC -> $TGT"
-[ "$SPLIT" = "1" ] && [ -n "$unit_pr" ] && subject="$subject (#$unit_pr)"
+if [ "$SPLIT" = "1" ] && [ -n "$unit_pr" ]; then
+  subject="$subject (#$unit_pr)"
+fi
 
 git commit -q -m "$subject" \
   -m "Code-only $LABEL. VERSION stays on ${TGT}'s own sequence, advanced one step here."
