@@ -48,6 +48,7 @@ concurrency:
   # Keyed off the branch being promoted, not the ref the run was dispatched
   # from -- a manual run is always dispatched from the default branch, so
   # github.ref_name would collapse dev->qa and qa->main into one queue.
+  # Must agree with the src that "Resolve source and target" will pick.
   group: promote-${{ github.event.inputs.source || github.ref_name }}
   cancel-in-progress: false
 
@@ -80,6 +81,11 @@ jobs:
           SRC: ${{ steps.route.outputs.src }}
           TGT: ${{ steps.route.outputs.tgt }}
           BR: ${{ steps.route.outputs.branch }}
+          # One ORIGINAL unit of work per promotion PR instead of everything
+          # that has accumulated. A 20-file batch is what drove the skeptical
+          # reviewers past their file budget, so they rejected on "could not
+          # verify" rather than on any real defect.
+          PROMOTE_SPLIT: '1'
         run: |
           git config user.name  "promote-bot[bot]"
           git config user.email "promote-bot@users.noreply.github.com"
@@ -96,21 +102,45 @@ jobs:
           SRC: ${{ steps.route.outputs.src }}
           TGT: ${{ steps.route.outputs.tgt }}
           BR: ${{ steps.route.outputs.branch }}
+          UNIT_PR: ${{ steps.build.outputs.unit_pr }}
+          UNIT_SUBJECT: ${{ steps.build.outputs.unit_subject }}
+          REMAINING: ${{ steps.build.outputs.remaining }}
         run: |
           set -e
-          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
-          if [ -n "$existing" ]; then
-            echo "PR #$existing already open for $BR (force-pushed with the latest $SRC)."
-            exit 0
+          # Name the ORIGINAL work, not just the hop -- with one unit per
+          # promotion PR, "promote: dev -> qa" alone no longer identifies which
+          # change is in flight. The `promote:` prefix is load-bearing:
+          # fleet_guardrails.is_promotion matches on it.
+          title="promote: $SRC -> $TGT"
+          if [ -n "$UNIT_SUBJECT" ]; then
+            if [ -n "$UNIT_PR" ]; then
+              title="$title (#$UNIT_PR: $UNIT_SUBJECT)"
+            else
+              title="$title ($UNIT_SUBJECT)"
+            fi
           fi
           {
             printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
+            if [ -n "$UNIT_SUBJECT" ]; then
+              printf 'Carries **one unit of work**'
+              [ -n "$UNIT_PR" ] && printf ' (originally #%s)' "$UNIT_PR"
+              printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
+              if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
+                printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
+                printf 'be promoted once this PR merges, oldest first.\n\n' 
+              fi
+            fi
             printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
             printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
             printf 'A version set on `%s` never leaks across.\n' "$SRC"
           } > /tmp/promote-body.md
+          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for $BR (branch force-pushed; preserving existing PR title and body)."
+            exit 0
+          fi
           gh pr create --base "$TGT" --head "$BR" \
-            --title "promote: $SRC -> $TGT" \
+            --title "$title" \
             --body-file /tmp/promote-body.md
 
       # A PR opened with GITHUB_TOKEN does not start its checks automatically --
