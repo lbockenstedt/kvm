@@ -190,36 +190,63 @@ fi
 # over any later unit that touches a file this promotion already touches, and
 # carry them together. Units that touch nothing in common are still left
 # behind, so promotions stay small and reviewable.
+coalesced=0
+orig_idx="$picked_idx"
 if [ "$SPLIT" = "1" ]; then
+  # VERSION and AGENTS.md are touched by nearly every unit; counting them
+  # would chain every unit together and revert to batched promotion.
+  shared_filter() { grep -vE '(^|/)VERSION$|(^|/)AGENTS\.md$' || true; }
   ext_idx="$picked_idx"
-  changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | sort -u)"
+  if ! all_files="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}")"; then
+    echo "::error::git diff failed for origin/$TGT...${units[$picked_idx]}"
+    exit 1
+  fi
+  changed="$(printf '%s\n' "$all_files" | shared_filter | sed '/^$/d' | sort -u)"
   j=$(( picked_idx + 1 ))
   while [ "$j" -lt "${#units[@]}" ]; do
-    # Files this one unit changed. First-parent listing means ^ is the
-    # previous unit, so this is exactly that unit's own contribution.
-    unit_files="$(git diff --name-only "${units[$j]}^...${units[$j]}" 2>/dev/null | sort -u)"
+    # First-parent listing means ^ is the previous unit.
+    if ! parent="$(git rev-parse --verify -q "${units[$j]}^")"; then
+      echo "::error::cannot resolve parent of unit ${units[$j]}"
+      exit 1
+    fi
+    if ! unit_all="$(git diff --name-only "$parent" "${units[$j]}")"; then
+      echo "::error::git diff failed for unit ${units[$j]}"
+      exit 1
+    fi
+    unit_files="$(printf '%s\n' "$unit_all" | shared_filter | sed '/^$/d' | sort -u)"
     if [ -n "$unit_files" ] && [ -n "$changed" ] \
        && printf '%s\n' "$unit_files" \
           | comm -12 - <(printf '%s\n' "$changed") | grep -q .; then
       ext_idx="$j"
-      # Everything from the target up to the new endpoint is in play now,
-      # including any unit pulled in between.
-      changed="$(git diff --name-only "origin/$TGT...${units[$j]}" | sort -u)"
+      if ! all_files="$(git diff --name-only "origin/$TGT...${units[$j]}")"; then
+        echo "::error::git diff failed for origin/$TGT...${units[$j]}"
+        exit 1
+      fi
+      changed="$(printf '%s\n' "$all_files" | shared_filter | sed '/^$/d' | sort -u)"
     fi
     j=$(( j + 1 ))
   done
   if [ "$ext_idx" -ne "$picked_idx" ]; then
     echo "  extending unit $picked_idx -> $ext_idx: later unit(s) modify the same" \
          "file(s); promoting an already-superseded version would be rejected"
-    if stage_to "${units[$ext_idx]}"; then
+    ext_rc=0
+    stage_to "${units[$ext_idx]}" || ext_rc=$?
+    if [ "$ext_rc" -eq 0 ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
+      coalesced=1
     else
-      # Cannot happen (a superset of a real change is a real change), but if
-      # it ever did, fall back to the unextended unit rather than promoting a
-      # half-staged tree.
-      echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
-      stage_to "$picked" || true
+      if [ "$ext_rc" -eq 2 ]; then
+        echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- keeping unit $picked_idx"
+      else
+        echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      fi
+      back_rc=0
+      stage_to "$picked" || back_rc=$?
+      if [ "$back_rc" -ne 0 ]; then
+        echo "::error::re-staging unit $picked failed (rc=$back_rc) -- refusing to promote a half-staged tree"
+        exit 1
+      fi
     fi
   fi
 fi
@@ -235,6 +262,12 @@ if [ -n "$unit_pr" ]; then
 else
   # Squash merges land as "feat: thing (#123)".
   unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+fi
+if [ "$coalesced" = "1" ]; then
+  # Several units are carried; quoting one PR's intent would misattribute
+  # the diff, so do not claim a single originating PR.
+  unit_subject="units $orig_idx-$picked_idx coalesced (superseding changes to shared files)"
+  unit_pr=""
 fi
 
 # Upper bound: the units behind this one are not re-examined here, and any of
