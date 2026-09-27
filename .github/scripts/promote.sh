@@ -188,9 +188,11 @@ fi
 # unit has already corrected: that asks the panel to approve code known to be
 # superseded. So once the oldest unit is picked, extend the endpoint forward
 # over any later unit that touches a file this promotion already touches, and
-# carry them together. Units that touch nothing in common are still left
-# behind, so promotions stay small and reviewable.
+# carry them together. Only units AFTER the chosen endpoint that touch
+# nothing in common stay behind; in-between units are carried regardless,
+# because merging an ancestor of $SRC carries its whole first-parent history.
 coalesced=0
+coalesced_prs=""
 orig_idx="$picked_idx"
 if [ "$SPLIT" = "1" ]; then
   # VERSION and AGENTS.md are touched by nearly every unit; counting them
@@ -235,6 +237,14 @@ if [ "$SPLIT" = "1" ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
       coalesced=1
+      k="$orig_idx"
+      while [ "$k" -le "$picked_idx" ]; do
+        s="$(git log -1 --format=%s "${units[$k]}")"
+        p="$(printf '%s' "$s" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
+        [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+        [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs }$p"
+        k=$(( k + 1 ))
+      done
     else
       if [ "$ext_rc" -eq 2 ]; then
         echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- keeping unit $picked_idx"
@@ -266,7 +276,7 @@ fi
 if [ "$coalesced" = "1" ]; then
   # Several units are carried; quoting one PR's intent would misattribute
   # the diff, so do not claim a single originating PR.
-  unit_subject="units $orig_idx-$picked_idx coalesced (superseding changes to shared files)"
+  unit_subject="units $(( orig_idx + 1 ))-$(( picked_idx + 1 )) of ${#units[@]} coalesced (superseding changes to shared files)"
   unit_pr=""
 fi
 
@@ -279,6 +289,8 @@ if [ "$SPLIT" = "1" ]; then
     echo "unit_sha=$(git rev-parse "$picked")"
     echo "unit_pr=$unit_pr"
     echo "remaining=$remaining"
+    echo "coalesced=$coalesced"
+    echo "coalesced_prs=$coalesced_prs"
   } >> "$out"
   # Multi-line values need the heredoc form of the step-output protocol.
   eof_delim="PROMOTE_EOF_$(od -An -N8 -tx /dev/urandom 2>/dev/null | tr -d ' ' || echo "$$")"
