@@ -176,6 +176,91 @@ if [ -z "$picked" ]; then
   exit 0
 fi
 
+# COALESCE SUPERSEDED UNITS.
+#
+# Splitting by unit created a deadlock the first time it met a self-correcting
+# change. Unit 1 shipped a defect; unit 2 fixed it. But unit 2 cannot be
+# promoted until unit 1 merges, and unit 1 cannot merge because the review
+# panel correctly rejects the defect that unit 2 already fixed. The fleet
+# stalled with every repo holding the same rejected unit-1 PR.
+#
+# The root mistake is promoting a file at an intermediate state that a LATER
+# unit has already corrected: that asks the panel to approve code known to be
+# superseded. So once the oldest unit is picked, extend the endpoint forward
+# over any later unit that touches a file this promotion already touches, and
+# carry them together. Only units AFTER the chosen endpoint that touch
+# nothing in common stay behind; in-between units are carried regardless,
+# because merging an ancestor of $SRC carries its whole first-parent history.
+coalesced=0
+coalesced_prs=""
+orig_idx="$picked_idx"
+if [ "$SPLIT" = "1" ]; then
+  # VERSION and AGENTS.md are touched by nearly every unit; counting them
+  # would chain every unit together and revert to batched promotion.
+  shared_filter() { grep -vE '(^|/)VERSION$|(^|/)AGENTS\.md$' || true; }
+  ext_idx="$picked_idx"
+  if ! all_files="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}")"; then
+    echo "::error::git diff failed for origin/$TGT...${units[$picked_idx]}"
+    exit 1
+  fi
+  changed="$(printf '%s\n' "$all_files" | shared_filter | sed '/^$/d' | sort -u)"
+  j=$(( picked_idx + 1 ))
+  while [ "$j" -lt "${#units[@]}" ]; do
+    # First-parent listing means ^ is the previous unit.
+    if ! parent="$(git rev-parse --verify -q "${units[$j]}^")"; then
+      echo "::error::cannot resolve parent of unit ${units[$j]}"
+      exit 1
+    fi
+    if ! unit_all="$(git diff --name-only "$parent" "${units[$j]}")"; then
+      echo "::error::git diff failed for unit ${units[$j]}"
+      exit 1
+    fi
+    unit_files="$(printf '%s\n' "$unit_all" | shared_filter | sed '/^$/d' | sort -u)"
+    if [ -n "$unit_files" ] && [ -n "$changed" ] \
+       && printf '%s\n' "$unit_files" \
+          | comm -12 - <(printf '%s\n' "$changed") | grep -q .; then
+      ext_idx="$j"
+      if ! all_files="$(git diff --name-only "origin/$TGT...${units[$j]}")"; then
+        echo "::error::git diff failed for origin/$TGT...${units[$j]}"
+        exit 1
+      fi
+      changed="$(printf '%s\n' "$all_files" | shared_filter | sed '/^$/d' | sort -u)"
+    fi
+    j=$(( j + 1 ))
+  done
+  if [ "$ext_idx" -ne "$picked_idx" ]; then
+    echo "  extending unit $picked_idx -> $ext_idx: later unit(s) modify the same" \
+         "file(s); promoting an already-superseded version would be rejected"
+    ext_rc=0
+    stage_to "${units[$ext_idx]}" || ext_rc=$?
+    if [ "$ext_rc" -eq 0 ]; then
+      picked="${units[$ext_idx]}"
+      picked_idx="$ext_idx"
+      coalesced=1
+      k="$orig_idx"
+      while [ "$k" -le "$picked_idx" ]; do
+        s="$(git log -1 --format=%s "${units[$k]}")"
+        p="$(printf '%s' "$s" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
+        [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+        [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs }$p"
+        k=$(( k + 1 ))
+      done
+    else
+      if [ "$ext_rc" -eq 2 ]; then
+        echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- keeping unit $picked_idx"
+      else
+        echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      fi
+      back_rc=0
+      stage_to "$picked" || back_rc=$?
+      if [ "$back_rc" -ne 0 ]; then
+        echo "::error::re-staging unit $picked failed (rc=$back_rc) -- refusing to promote a half-staged tree"
+        exit 1
+      fi
+    fi
+  fi
+fi
+
 # Identify the unit for the PR title/body. A merge commit names its PR in the
 # subject and carries the PR's own title on the first line of the body, which
 # is far more useful than "Merge pull request #123 from user/branch".
@@ -188,6 +273,12 @@ else
   # Squash merges land as "feat: thing (#123)".
   unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
 fi
+if [ "$coalesced" = "1" ]; then
+  # Several units are carried; quoting one PR's intent would misattribute
+  # the diff, so do not claim a single originating PR.
+  unit_subject="units $(( orig_idx + 1 ))-$(( picked_idx + 1 )) of ${#units[@]} coalesced (superseding changes to shared files)"
+  unit_pr=""
+fi
 
 # Upper bound: the units behind this one are not re-examined here, and any of
 # them may yet be skipped as a no-op. Reported as "up to" for that reason.
@@ -198,6 +289,8 @@ if [ "$SPLIT" = "1" ]; then
     echo "unit_sha=$(git rev-parse "$picked")"
     echo "unit_pr=$unit_pr"
     echo "remaining=$remaining"
+    echo "coalesced=$coalesced"
+    echo "coalesced_prs=$coalesced_prs"
   } >> "$out"
   # Multi-line values need the heredoc form of the step-output protocol.
   eof_delim="PROMOTE_EOF_$(od -An -N8 -tx /dev/urandom 2>/dev/null | tr -d ' ' || echo "$$")"
