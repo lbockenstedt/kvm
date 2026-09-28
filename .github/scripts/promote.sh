@@ -94,8 +94,8 @@ fi
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op, and
-# 2 when a split unit conflicts against $TGT (the caller falls back to a batched
-# merge). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
+# 2 when the endpoint conflicts against $TGT (the caller batches an intermediate
+# unit into the next endpoint; a conflict on the tip is fatal). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
 stage_to() {
   local endpoint="$1"
 
@@ -129,12 +129,14 @@ stage_to() {
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
   if git ls-files -u | grep -q .; then
-    if [ "$SPLIT" = "1" ] && [ "$endpoint" != "origin/$SRC" ]; then
-      return 2
-    fi
-    echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand:"
+    # Diagnose, but do NOT decide. A conflict on an intermediate unit is
+    # recoverable -- the caller batches it into the next endpoint -- while a
+    # conflict on the final endpoint is fatal. Exiting here denied the caller
+    # that choice, and annotating every conflict as ::error:: marked
+    # recoverable runs as failures, so severity belongs to the caller.
+    echo "  merge conflict outside VERSION staging $SRC -> $TGT:"
     git ls-files -u | awk '{print "  " $4}' | sort -u
-    exit 1
+    return 2
   fi
 
   if git diff --cached --quiet && git diff --quiet; then
@@ -145,28 +147,53 @@ stage_to() {
 
 picked=""
 picked_idx=0
+conflicted=0
 for i in "${!units[@]}"; do
-  rc=0
-  stage_to "${units[$i]}" || rc=$?
-  if [ "$rc" -eq 0 ]; then
+  sel_rc=0
+  stage_to "${units[$i]}" || sel_rc=$?
+  if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
     break
-  elif [ "$rc" -eq 2 ]; then
-    echo "  split unit ${units[$i]} conflicts against $TGT -- falling back to batched merge origin/$SRC"
-    units=("origin/$SRC")
-    SPLIT=0
-    if stage_to "origin/$SRC"; then
-      picked="origin/$SRC"
-      picked_idx=0
+  fi
+  if [ "$sel_rc" -eq 2 ]; then
+    # A conflicting unit is SKIPPED, not fatal. Units come from
+    # `rev-list --reverse --first-parent $TGT..$SRC` and stage_to builds "$TGT
+    # plus everything UP TO <endpoint>", so they are cumulative prefixes:
+    # units[i+1] is a strict SUPERSET of units[i]. Advancing batches the two
+    # together -- it cannot reorder or drop anything -- and the last endpoint
+    # is the tip of $SRC, so the loop still makes progress whenever $SRC as a
+    # whole is mergeable.
+    #
+    # Treating this as fatal froze promotion for exactly the repos that needed
+    # it most: once AppBuilder committed a repair onto a promotion branch, $TGT
+    # held a change the OLD units predate, so the oldest outstanding unit
+    # conflicted against it forever -- even after a back-merge had made the
+    # full $SRC -> $TGT merge clean. tsa failed this way every run while
+    # `git merge origin/qa` into main succeeded by hand.
+    if [ "$i" -eq $(( ${#units[@]} - 1 )) ]; then
+      conflicted=1
+    else
+      echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
+           "batching it with the next unit"
     fi
-    break
-  elif [ "$rc" -eq 1 ]; then
-    if [ "$SPLIT" = "1" ]; then
-      echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
-    fi
+    continue
+  fi
+  # The final endpoint did not conflict; only its own result decides fatality.
+  conflicted=0
+  if [ "$SPLIT" = "1" ]; then
+    echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
   fi
 done
+
+# The final endpoint (the tip of $SRC) itself conflicted. That is a real
+# divergence a human must reconcile -- and it must NOT fall through to the
+# "Nothing to promote" branch below, which would report success while
+# promoting nothing.
+if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+  echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
+  exit 1
+fi
 
 if [ -z "$picked" ]; then
   # Phrase the no-op with $LABEL: "Nothing to promote" is the string every
