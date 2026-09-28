@@ -181,6 +181,8 @@ jobs:
           UNIT_PR: ${{ steps.build.outputs.unit_pr }}
           UNIT_SUBJECT: ${{ steps.build.outputs.unit_subject }}
           REMAINING: ${{ steps.build.outputs.remaining }}
+          COALESCED: ${{ steps.build.outputs.coalesced }}
+          COALESCED_PRS: ${{ steps.build.outputs.coalesced_prs }}
         run: |
           set -e
           # Name the ORIGINAL work, not just the hop -- with one unit per
@@ -210,7 +212,9 @@ jobs:
           # no intent" is simply false, and it hides a broken token or a deleted PR.
           intent=""
           intent_state="no-unit"
-          if [ -n "$UNIT_PR" ]; then
+          if [ "${COALESCED:-0}" = "1" ]; then
+            intent_state="coalesced"
+          elif [ -n "$UNIT_PR" ]; then
             # Pessimistic default: only a confirmed exit 0 clears it.
             intent_state="fetch-failed"
             if unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"; then
@@ -257,7 +261,11 @@ jobs:
                         | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
           {
             printf '## Intent & Problem Statement\n\n'
-            if [ -n "$UNIT_SUBJECT" ]; then
+            if [ "${COALESCED:-0}" = "1" ]; then
+              printf 'Promotes **several coalesced units of work** from `%s` into `%s`' "$SRC" "$TGT"
+              [ -n "$COALESCED_PRS" ] && printf ' (originally %s)' "$(printf '#%s ' $COALESCED_PRS | sed 's/ $//')"
+              printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
+            elif [ -n "$UNIT_SUBJECT" ]; then
               printf 'Promotes **one unit of work** from `%s` into `%s`' "$SRC" "$TGT"
               [ -n "$UNIT_PR" ] && printf ' (originally #%s)' "$UNIT_PR"
               printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
@@ -265,6 +273,33 @@ jobs:
               printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
             fi
             case "$intent_state" in
+              coalesced)
+                printf 'Later units touching the same files were coalesced so no superseded\n'
+                printf 'intermediate state reaches review. Intent of each carried PR:\n\n'
+                if [ -z "$COALESCED_PRS" ]; then
+                  printf '_None of the coalesced units names an originating PR._\n\n'
+                fi
+                for p in $COALESCED_PRS; do
+                  if b="$(gh pr view "$p" --json body -q .body 2>/dev/null)"; then
+                    if printf '%s\n' "$b" | grep -qE '^#+.*Intent & Problem Statement'; then
+                      it="$(printf '%s\n' "$b" | awk '
+                        /^#/ && /Intent & Problem Statement/ { f=1; next }
+                        f && /^#/ { exit }
+                        f { print }' | sed 's/<!--.*-->//' | sed '/^[[:space:]]*$/d')"
+                      if [ -n "$it" ]; then
+                        printf 'From #%s:\n\n' "$p"
+                        printf '%s\n' "$it" | sed 's/^/> /'
+                        printf '\n'
+                      else
+                        printf -- '- _#%s left its Intent section unfilled._\n\n' "$p"
+                      fi
+                    else
+                      printf -- '- _#%s stated no Intent section._\n\n' "$p"
+                    fi
+                  else
+                    printf -- '- _Could not read #%s (fetch failed); its intent is UNKNOWN, not absent._\n\n' "$p"
+                  fi
+                done ;;
               ok)
                 printf 'Intent carried from #%s:\n\n' "$UNIT_PR"
                 printf '%s\n' "$intent" | sed 's/^/> /'
