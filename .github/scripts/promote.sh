@@ -63,13 +63,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # then silently continued as the target's older batched script and swept up
 # every remaining unit in one go. Re-exec so the running code is immutable.
 if [ -z "${PROMOTE_REEXEC:-}" ]; then
-  if [ ! -f "$here/bump_version.py" ]; then
-    echo "::error::bump_version.py not found in $here"
-    exit 1
-  fi
   PROMOTE_TMPDIR="$(mktemp -d)"
   cp "$here/promote.sh" "$PROMOTE_TMPDIR/"
-  cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
+  [ -f "$here/bump_version.py" ] && cp "$here/bump_version.py" "$PROMOTE_TMPDIR/"
   export PROMOTE_REEXEC=1 PROMOTE_TMPDIR
   exec bash "$PROMOTE_TMPDIR/promote.sh" "$@"
 fi
@@ -83,14 +79,10 @@ git rev-parse --verify "origin/$TGT" >/dev/null 2>&1 || { echo "::error::target 
 units=()
 if [ "$SPLIT" = "1" ]; then
   while IFS= read -r c; do
-    if [ -n "$c" ]; then
-      units+=("$c")
-    fi
+    [ -n "$c" ] && units+=("$c")
   done < <(git rev-list --reverse --first-parent "origin/$TGT..origin/$SRC")
 fi
-if [ "${#units[@]}" -eq 0 ]; then
-  units=("origin/$SRC")
-fi
+[ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op, and
@@ -106,12 +98,7 @@ stage_to() {
   git checkout -q -B "$BR" "origin/$TGT"
 
   # --no-ff: the promotion is always an explicit, revertable commit.
-  local merge_err=0
-  git merge --no-commit --no-ff "$endpoint" || merge_err=$?
-  if [ "$merge_err" -ne 0 ] && ! git ls-files -u | grep -q .; then
-    echo "::error::git merge failed without unmerged files (exit $merge_err)"
-    exit 1
-  fi
+  git merge --no-commit --no-ff "$endpoint" || true
 
   # Pin VERSION to the target's lineage. Listing from the TARGET tree means a
   # VERSION file added on the source is simply never carried over.
@@ -129,11 +116,11 @@ stage_to() {
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
   if git ls-files -u | grep -q .; then
-    # Diagnose, but do NOT decide. A conflict on an intermediate unit is
-    # recoverable -- the caller batches it into the next endpoint -- while a
-    # conflict on the final endpoint is fatal. Exiting here denied the caller
-    # that choice, and annotating every conflict as ::error:: marked
-    # recoverable runs as failures, so severity belongs to the caller.
+    # Diagnose, but do NOT decide. A conflict while EXTENDING a unit is
+    # recoverable -- the caller keeps the original unit -- while a conflict on
+    # the primary selection is fatal. Exiting here denied the caller that
+    # choice, and annotating every conflict as ::error:: marked recoverable
+    # runs as failures, so severity belongs to whoever called us.
     echo "  merge conflict outside VERSION staging $SRC -> $TGT:"
     git ls-files -u | awk '{print "  " $4}' | sort -u
     return 2
@@ -148,47 +135,58 @@ stage_to() {
 picked=""
 picked_idx=0
 conflicted=0
+# The code returned by the LAST endpoint tried (the tip of $SRC when nothing
+# is picked). Only that one decides whether an unpicked run is a real
+# divergence: an early unit may conflict in isolation while the full merge is
+# a clean no-op, and that is "nothing to promote", not a conflict.
+last_rc=0
 for i in "${!units[@]}"; do
   sel_rc=0
   stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
   if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
     break
   fi
   if [ "$sel_rc" -eq 2 ]; then
-    # A conflicting unit is SKIPPED, not fatal. Units come from
-    # `rev-list --reverse --first-parent $TGT..$SRC` and stage_to builds "$TGT
-    # plus everything UP TO <endpoint>", so they are cumulative prefixes:
-    # units[i+1] is a strict SUPERSET of units[i]. Advancing batches the two
-    # together -- it cannot reorder or drop anything -- and the last endpoint
-    # is the tip of $SRC, so the loop still makes progress whenever $SRC as a
-    # whole is mergeable.
+    # A conflicting unit is SKIPPED, not fatal. This used to exit 1 on the
+    # reasoning that "promoting a later unit ahead of it would reorder the
+    # branch" -- but units come from `rev-list --reverse --first-parent
+    # $TGT..$SRC` and stage_to builds "$TGT plus everything UP TO <endpoint>",
+    # so they are cumulative prefixes. units[i+1] is a strict SUPERSET of
+    # units[i]: advancing batches the two together, it cannot reorder or drop
+    # anything. The last endpoint is the tip of $SRC -- the batched merge --
+    # so the loop still makes progress whenever $SRC as a whole is mergeable.
     #
-    # Treating this as fatal froze promotion for exactly the repos that needed
-    # it most: once AppBuilder committed a repair onto a promotion branch, $TGT
-    # held a change the OLD units predate, so the oldest outstanding unit
-    # conflicted against it forever -- even after a back-merge had made the
-    # full $SRC -> $TGT merge clean. tsa failed this way every run while
-    # `git merge origin/qa` into main succeeded by hand.
+    # Aborting here froze promotion for exactly the repos that needed it most.
+    # After AppBuilder committed a repair onto a promotion branch, $TGT gained
+    # a change that the OLD units predate, so the oldest outstanding unit
+    # conflicted against it forever -- even once a back-merge had made the full
+    # $SRC -> $TGT merge clean. tsa failed this way every run
+    # ("CONFLICT (content): Merge conflict in .github/workflows/promote.yml")
+    # while `git merge origin/qa` into main succeeded by hand.
     conflicted=1
     echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
-         "batching it with the next unit"
+         "batching it forward with the following unit(s)"
     continue
   fi
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
-# Every endpoint conflicted, including the tip of $SRC. That is a real
-# divergence a human must reconcile -- and it must NOT fall through to the
-# "Nothing to promote" branch below, which would report success while
-# promoting nothing.
-if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+# The LAST endpoint -- the tip of $SRC -- conflicted. That is a real divergence
+# a human has to reconcile, distinct from "nothing to promote", which must not
+# be reported for it. Keying off the last code rather than the sticky
+# `conflicted` flag matters: an early unit can conflict in isolation while the
+# tip turns out to be a clean content no-op (rc 1) against $TGT, and that state
+# proves there is no divergence at all.
+if [ -z "$picked" ] && [ "$last_rc" -eq 2 ]; then
   echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
   exit 1
 fi
 
 if [ -z "$picked" ]; then
+  [ "$conflicted" -eq 1 ] && echo "  an earlier unit conflicted in isolation, but $SRC as a whole is a content no-op against $TGT"
   # Phrase the no-op with $LABEL: "Nothing to promote" is the string every
   # repo's promotion_selftest.sh matches on, so the forward direction must keep
   # saying exactly that, while the reverse direction still reads correctly
@@ -210,43 +208,23 @@ fi
 # unit has already corrected: that asks the panel to approve code known to be
 # superseded. So once the oldest unit is picked, extend the endpoint forward
 # over any later unit that touches a file this promotion already touches, and
-# carry them together. Only units AFTER the chosen endpoint that touch
-# nothing in common stay behind; in-between units are carried regardless,
-# because merging an ancestor of $SRC carries its whole first-parent history.
-coalesced=0
-coalesced_prs=""
-orig_idx="$picked_idx"
+# carry them together. Units that touch nothing in common are still left
+# behind, so promotions stay small and reviewable.
 if [ "$SPLIT" = "1" ]; then
-  # VERSION and AGENTS.md are touched by nearly every unit; counting them
-  # would chain every unit together and revert to batched promotion.
-  shared_filter() { grep -vE '(^|/)VERSION$|(^|/)AGENTS\.md$' || true; }
   ext_idx="$picked_idx"
-  if ! all_files="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}")"; then
-    echo "::error::git diff failed for origin/$TGT...${units[$picked_idx]}"
-    exit 1
-  fi
-  changed="$(printf '%s\n' "$all_files" | shared_filter | sed '/^$/d' | sort -u)"
+  changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | sort -u)"
   j=$(( picked_idx + 1 ))
   while [ "$j" -lt "${#units[@]}" ]; do
-    # First-parent listing means ^ is the previous unit.
-    if ! parent="$(git rev-parse --verify -q "${units[$j]}^")"; then
-      echo "::error::cannot resolve parent of unit ${units[$j]}"
-      exit 1
-    fi
-    if ! unit_all="$(git diff --name-only "$parent" "${units[$j]}")"; then
-      echo "::error::git diff failed for unit ${units[$j]}"
-      exit 1
-    fi
-    unit_files="$(printf '%s\n' "$unit_all" | shared_filter | sed '/^$/d' | sort -u)"
+    # Files this one unit changed. First-parent listing means ^ is the
+    # previous unit, so this is exactly that unit's own contribution.
+    unit_files="$(git diff --name-only "${units[$j]}^...${units[$j]}" 2>/dev/null | sort -u)"
     if [ -n "$unit_files" ] && [ -n "$changed" ] \
        && printf '%s\n' "$unit_files" \
           | comm -12 - <(printf '%s\n' "$changed") | grep -q .; then
       ext_idx="$j"
-      if ! all_files="$(git diff --name-only "origin/$TGT...${units[$j]}")"; then
-        echo "::error::git diff failed for origin/$TGT...${units[$j]}"
-        exit 1
-      fi
-      changed="$(printf '%s\n' "$all_files" | shared_filter | sed '/^$/d' | sort -u)"
+      # Everything from the target up to the new endpoint is in play now,
+      # including any unit pulled in between.
+      changed="$(git diff --name-only "origin/$TGT...${units[$j]}" | sort -u)"
     fi
     j=$(( j + 1 ))
   done
@@ -258,15 +236,6 @@ if [ "$SPLIT" = "1" ]; then
     if [ "$ext_rc" -eq 0 ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
-      coalesced=1
-      k="$orig_idx"
-      while [ "$k" -le "$picked_idx" ]; do
-        s="$(git log -1 --format=%s "${units[$k]}")"
-        p="$(printf '%s' "$s" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
-        [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
-        [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs }$p"
-        k=$(( k + 1 ))
-      done
     else
       # stage_to is tri-state, so 1 and 2 must not be reported alike: 2 is a real
       # merge conflict and 1 is a genuine no-op. Collapsing them printed "content
@@ -306,12 +275,6 @@ else
   # Squash merges land as "feat: thing (#123)".
   unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
 fi
-if [ "$coalesced" = "1" ]; then
-  # Several units are carried; quoting one PR's intent would misattribute
-  # the diff, so do not claim a single originating PR.
-  unit_subject="units $(( orig_idx + 1 ))-$(( picked_idx + 1 )) of ${#units[@]} coalesced (superseding changes to shared files)"
-  unit_pr=""
-fi
 
 # Upper bound: the units behind this one are not re-examined here, and any of
 # them may yet be skipped as a no-op. Reported as "up to" for that reason.
@@ -322,15 +285,12 @@ if [ "$SPLIT" = "1" ]; then
     echo "unit_sha=$(git rev-parse "$picked")"
     echo "unit_pr=$unit_pr"
     echo "remaining=$remaining"
-    echo "coalesced=$coalesced"
-    echo "coalesced_prs=$coalesced_prs"
   } >> "$out"
   # Multi-line values need the heredoc form of the step-output protocol.
-  eof_delim="PROMOTE_EOF_$(od -An -N8 -tx /dev/urandom 2>/dev/null | tr -d ' ' || echo "$$")"
   {
-    echo "unit_subject<<$eof_delim"
+    echo "unit_subject<<PROMOTE_EOF"
     echo "$unit_subject"
-    echo "$eof_delim"
+    echo "PROMOTE_EOF"
   } >> "$out"
   echo "Promoting the oldest of ${#units[@]} un-promoted unit(s): ${unit_pr:+#$unit_pr }$unit_subject"
   echo "  up to $remaining further unit(s) will follow in later runs"
@@ -348,9 +308,7 @@ while IFS= read -r f; do
 done < <(version_files)
 
 subject="$LABEL: $SRC -> $TGT"
-if [ "$SPLIT" = "1" ] && [ -n "$unit_pr" ]; then
-  subject="$subject (#$unit_pr)"
-fi
+[ "$SPLIT" = "1" ] && [ -n "$unit_pr" ] && subject="$subject (#$unit_pr)"
 
 git commit -q -m "$subject" \
   -m "Code-only $LABEL. VERSION stays on ${TGT}'s own sequence, advanced one step here."
