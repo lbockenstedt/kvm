@@ -94,8 +94,8 @@ fi
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op, and
-# 2 when a split unit conflicts against $TGT (the caller falls back to a batched
-# merge). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
+# 2 when the endpoint conflicts against $TGT (the caller batches an intermediate
+# unit into the next endpoint; a conflict on the tip is fatal). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
 stage_to() {
   local endpoint="$1"
 
@@ -171,15 +171,22 @@ for i in "${!units[@]}"; do
     # conflicted against it forever -- even after a back-merge had made the
     # full $SRC -> $TGT merge clean. tsa failed this way every run while
     # `git merge origin/qa` into main succeeded by hand.
-    conflicted=1
-    echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
-         "batching it with the next unit"
+    if [ "$i" -eq $(( ${#units[@]} - 1 )) ]; then
+      conflicted=1
+    else
+      echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
+           "batching it with the next unit"
+    fi
     continue
   fi
-  [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
+  # The final endpoint did not conflict; only its own result decides fatality.
+  conflicted=0
+  if [ "$SPLIT" = "1" ]; then
+    echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
+  fi
 done
 
-# Every endpoint conflicted, including the tip of $SRC. That is a real
+# The final endpoint (the tip of $SRC) itself conflicted. That is a real
 # divergence a human must reconcile -- and it must NOT fall through to the
 # "Nothing to promote" branch below, which would report success while
 # promoting nothing.
