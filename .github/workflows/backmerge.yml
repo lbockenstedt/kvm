@@ -244,7 +244,12 @@ jobs:
           # per PR and they park at slightly different instants, so returning
           # after the first approval leaves the later one parked and the PR
           # blocked on a required check that never reports.
+          #
+          # A run counts as approved ONLY on a successful POST: a failed
+          # approval must stay retryable, must not let the quiet counter end
+          # the loop, and must not be reported as released.
           approved=""
+          failed=""
           quiet=0
           for _ in $(seq 1 24); do
             ids=$(gh api "repos/${{ github.repository }}/actions/runs?branch=$BR&status=action_required" \
@@ -253,9 +258,13 @@ jobs:
             for id in $ids; do
               case " $approved " in *" $id "*) continue ;; esac
               echo "approving parked run $id"
-              gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
-                echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
-              approved="$approved $id"
+              if gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve"; then
+                approved="$approved $id"
+                failed="$(printf '%s\n' $failed | grep -vx "$id" | tr '\n' ' ' || true)"
+              else
+                echo "::warning::could not approve run $id -- will retry on the next poll"
+                case " $failed " in *" $id "*) ;; *) failed="$failed $id" ;; esac
+              fi
               new="$new $id"
             done
             if [ -n "$approved" ] && [ -z "$new" ]; then
@@ -266,9 +275,13 @@ jobs:
             fi
             sleep 5
           done
+          failed="$(printf '%s' "$failed" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
           if [ -n "$approved" ]; then
             echo "::notice::released parked run(s):$approved"
-          else
+          fi
+          if [ -n "$failed" ]; then
+            echo "::error::still parked after retries: $failed -- approve these runs by hand or the required checks will never report"
+          elif [ -z "$approved" ]; then
             echo "::notice::no parked run found for $BR @ $SHA"
           fi
 
