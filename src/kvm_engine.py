@@ -211,6 +211,7 @@ class KVMEngine:
         Returns:
             Dictionary containing domain status and parsed XML details.
         """
+        # Without a libvirt connection there is nothing to look up.
         conn = self.connect()
         if not conn:
             return None
@@ -223,6 +224,7 @@ class KVMEngine:
             info["uuid"] = dom.UUIDString()
             return info
         except Exception as e:
+            # Unknown domain or libvirt error: log it and tell the caller "not found".
             logger.warning("Error fetching domain info for %s: %s", name_or_uuid, e)
             return None
 
@@ -235,6 +237,7 @@ class KVMEngine:
         Returns:
             Assigned domain UUID string if defined, None otherwise.
         """
+        # Without a libvirt connection nothing can be defined.
         conn = self.connect()
         if not conn:
             return None
@@ -243,6 +246,7 @@ class KVMEngine:
             dom = conn.defineXML(xml_content)
             return dom.UUIDString()
         except Exception as e:
+            # Bad XML or a libvirt rejection: log it and report failure as None.
             logger.error("Failed to define domain: %s", e)
             return None
 
@@ -255,6 +259,7 @@ class KVMEngine:
         Returns:
             True if started successfully, False otherwise.
         """
+        # Without a libvirt connection nothing can be started.
         conn = self.connect()
         if not conn:
             return False
@@ -262,6 +267,7 @@ class KVMEngine:
             # libvirt returns 0 from create() when the domain started.
             return self._lookup(conn, name_or_uuid).create() == 0
         except Exception as e:
+            # Unknown domain or start failure: log it and report False.
             logger.error("Failed to start domain %s: %s", name_or_uuid, e)
             return False
 
@@ -274,6 +280,7 @@ class KVMEngine:
         Returns:
             True if destroyed successfully, False otherwise.
         """
+        # Without a libvirt connection nothing can be stopped.
         conn = self.connect()
         if not conn:
             return False
@@ -281,6 +288,7 @@ class KVMEngine:
             # libvirt returns 0 from destroy() when the domain was stopped.
             return self._lookup(conn, name_or_uuid).destroy() == 0
         except Exception as e:
+            # Unknown domain or stop failure: log it and report False.
             logger.error("Failed to destroy domain %s: %s", name_or_uuid, e)
             return False
 
@@ -293,6 +301,7 @@ class KVMEngine:
         Returns:
             True if undefined successfully, False otherwise.
         """
+        # Without a libvirt connection nothing can be undefined.
         conn = self.connect()
         if not conn:
             return False
@@ -300,5 +309,6 @@ class KVMEngine:
             # libvirt returns 0 from undefine() when the definition was removed.
             return self._lookup(conn, name_or_uuid).undefine() == 0
         except Exception as e:
+            # Unknown domain or undefine failure: log it and report False.
             logger.error("Failed to undefine domain %s: %s", name_or_uuid, e)
             return False
