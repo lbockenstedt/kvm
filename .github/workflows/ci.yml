@@ -1,0 +1,51 @@
+name: CI
+
+# Gates the dev -> qa -> main promotion flow. `qa` and `main` require a PR, so
+# without a status check those gates would verify nothing. `test` is that
+# check; `dev` also runs on direct push, which contributors are allowed to make.
+
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ main, qa, dev ]
+
+# A newer push to the same branch or PR makes the older run pointless.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap checks first (about 20 s): fleet rules, new ruff errors, twin files
+  # (lm/docs/ci-checks.md). `test` waits for them. Dev only: promotion PRs into
+  # qa/main carry commits that already passed here.
+  checks:
+    if: (github.event_name == 'push' && github.ref_name == 'dev') || github.base_ref == 'dev'
+    permissions:
+      contents: read
+    uses: lbockenstedt/lm/.github/workflows/fleet-rules-reusable.yml@main
+
+  test:
+    # Run when checks passed or were skipped (qa/main PRs); the first step
+    # fails the job when checks failed, because a skipped required check would
+    # count as passing.
+    if: ${{ !cancelled() }}
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Stop early when an earlier job failed
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::A job this one needs failed (see 'checks'). Tests not run."
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      # The tests stub lm's BaseSpoke, so no lm checkout is needed. kvm has no
+      # requirements.txt; websockets is the one third-party import (control_plane),
+      # and the async tests need pytest-asyncio.
+      - name: Install dependencies
+        run: pip install pytest pytest-asyncio websockets
+      - name: Run tests
+        run: pytest -x -q tests
