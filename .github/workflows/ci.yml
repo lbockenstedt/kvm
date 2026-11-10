@@ -43,8 +43,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       # The tests stub lm's BaseSpoke, so no lm checkout is needed. kvm has no
-      # requirements.txt; websockets is the one third-party import (control_plane).
+      # requirements.txt; websockets is the one third-party import (control_plane),
+      # and the async tests need pytest-asyncio.
       - name: Install dependencies
-        run: pip install pytest websockets
+        run: pip install pytest pytest-asyncio websockets
       - name: Run tests
         run: pytest -q tests
