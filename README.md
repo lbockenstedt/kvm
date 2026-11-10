@@ -4,20 +4,6 @@ The `kvm` spoke module provides hypervisor management for standalone Linux KVM h
 
 ---
 
-## Repository layout
-
-| Path | What it holds |
-| :--- | :--- |
-| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
-| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
-| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
-| `src/` | The spoke's Python source (entry point, engine, control plane). |
-| `tests/` | pytest suite; CI runs it in the `test` job. |
-| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
-| `install_kvm.sh` | Installer (idempotent; safe to re-run). |
-| `README.md` | This file. |
-| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
-
 ## Architecture
 
 `kvm` uses a coordinator-and-agent model to bridge the LM Hub control plane with physical hypervisors:
