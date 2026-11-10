@@ -48,4 +48,4 @@ jobs:
       - name: Install dependencies
         run: pip install pytest pytest-asyncio websockets
       - name: Run tests
-        run: pytest -q tests
+        run: pytest -x -q tests
