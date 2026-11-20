@@ -8,6 +8,8 @@ virtual disk allocation and virtual network interface bridging.
 import logging
 # Standard-library XML parser used to read libvirt domain XML.
 import xml.etree.ElementTree as ET
+# Escapes caller values before they go into generated XML.
+from xml.sax.saxutils import escape as _xml_escape
 # Type hints only; they document the shapes of values passed around.
 from typing import Any, Dict, List, Optional
 
@@ -38,8 +40,16 @@ def generate_domain_xml(name: str, memory_mb: int, vcpus: int,
     Returns:
         String containing formatted Libvirt XML specification.
     """
+    # Escape every string (including quotes, since values sit in '...' attributes)
+    # and force the numbers to int, so a crafted name or path can't inject
+    # elements such as a host-device passthrough or a second disk.
+    def _esc(value: Any) -> str:
+        """XML-escape a value for an element or a quoted attribute."""
+        return _xml_escape(str(value), {"'": "&apos;", '"': "&quot;"})
+    name, disk_path, bridge_name = _esc(name), _esc(disk_path), _esc(bridge_name)
+    memory_mb, vcpus = int(memory_mb), int(vcpus)
     # Only emit a <mac> element when the caller supplied one; otherwise libvirt picks it.
-    mac_elem = f"<mac address='{mac_address}'/>\n" if mac_address else ""
+    mac_elem = f"<mac address='{_esc(mac_address)}'/>\n" if mac_address else ""
     # Fill the XML template below with the caller's values.
     return f"""<domain type='kvm'>
   <name>{name}</name>
@@ -66,7 +76,7 @@ def generate_domain_xml(name: str, memory_mb: int, vcpus: int,
       <model type='virtio'/>
       {mac_elem}
     </interface>
-    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'/>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
   </devices>
 </domain>"""
 

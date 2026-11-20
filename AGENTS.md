@@ -24,11 +24,11 @@ copy also lives in this repo's `docs/` — before making structural changes.
 ## kvm-specific gotchas
 
 - **Earliest-stage repo in the fleet** (`VERSION 0.03`) — thin compared to its siblings, and there is no dedicated `lm/docs/kvm.md` yet. Expect gaps.
-- **Shares `module_type = "hypervisor"` with `pxmx`.** Cross-check hub-side hypervisor handling before changing anything the hub dispatches on.
-- **`--hub` needs a full `ws://`/`wss://` URL here** — unlike most module installers, this one does **not** normalise a bare hostname.
+- **Shares `module_type = "hypervisor"` with `pxmx`.** Cross-check hub-side hypervisor handling before changing anything the hub dispatches on. The hub maps "hypervisor" to the pxmx update source, so the control plane refuses a SPOKE_UPDATE whose repo is not its own origin's (`_perform_self_update_sync`); hub-driven kvm updates need a kvm-aware update source in lm.
+- **`--hub`** takes a bare hostname (normalised to `wss://<host>:443`) or a `wss://` URL; `ws://` is refused.
 - `--admin-token` is deprecated: accepted and ignored.
-- The control plane authenticates agents with a shared secret and **fails closed** — see the README's "Required control-plane config".
-- No `docs/` or `tests/` directory yet.
+- The control plane authenticates agents with a shared secret over a **TLS-only** listener and **fails closed** (no secret or no cert: no agents) — see the README's "Control Plane Configuration". The secret is shared by all agents, so agent ids are self-asserted: a live id can't be taken over (a duplicate connection is refused), but a disconnected one can.
+- Tests live in `tests/` (run `python -m pytest -q tests`); module docs in `docs/`.
 
 <!-- fleet-rules:begin (synced from lm/.github/fleet-rules.md -- edit there) -->
 
