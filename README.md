@@ -85,6 +85,8 @@ Commands routed and executed by `src/kvm_spoke.py`:
 | `CREATE_VM` | Hub → Spoke → Agent | Relays domain creation request to target agent and flags cache for live refresh. |
 | `DELETE_VM` | Hub → Spoke → Agent | Relays domain destruction/undefine request and flags cache for live refresh. |
 
+`GET_VM_INFO`, `CREATE_VM` and `DELETE_VM` must name their host: a connected `agent_id`, a `unique_id` or `vm_id` of `<hostname>/<domain>`, or a bare domain name plus `node` (the hostname). The hostname must match exactly one agent, and an `agent_id` must agree with it. There is no "first agent" fallback. The agent is sent the resolved domain name. With `proxmox_tag`, the domain must carry that tag (otherwise "VM not found"). Without it, `DELETE_VM` needs `is_admin` and `CREATE_VM` needs `is_admin` or a tag. `GET_VM_INFO` with no tag is answered, because the hub authorizes it from the `tags` in the reply. `GET_VM_INFO` with `vm_id: "all"` returns every agent's VMs. The live-refresh flag is set only when the agent reports success. VM lists and node stats include an `errors` list naming any agent that failed to answer.
+
 ---
 
 ## Installation & Setup Instructions
@@ -98,26 +100,50 @@ Run on the spoke coordinator host or container:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/lbockenstedt/kvm/main/install_kvm.sh \
-  | sudo bash -s -- --hub wss://lm-hub.example.com:443
+  | sudo bash -s -- --hub lm-hub.example.com
 ```
 
 | Flag | Description |
 | :--- | :--- |
-| `--hub URL` | Full LM Hub WebSocket URL (`wss://<host>:443` or `ws://<host>:8765`). |
-| `--id`, `--name` | Unique spoke identifier (defaults to `<hostname>-kvm`). |
-| `--secret` | Pre-shared key for authenticating with the hub. |
+| `--hub HOST\|URL` | LM hub. A bare hostname becomes `wss://<host>:443`. `ws://` is refused. |
+| `--id`, `--name` | Unique spoke identifier (default `lm-kvm-<short hostname>`; a re-run keeps the saved one). |
+| `--secret` | Pre-shared key for authenticating with the hub (empty: await approval in the WebUI). |
+| `--hub-secret` | Optional hub secret for mutual authentication. |
+
+The installer clones the shared LM core into `/opt/lm-kvm/lm-core` and installs
+`websockets` and core's requirements into the venv. Secrets are written only to
+`/opt/lm-kvm/.env` (mode 600, the unit's `EnvironmentFile`); the service reads
+`SPOKE_SECRET` / `HUB_SECRET` from its environment, never from its command line.
 
 ### Control Plane Configuration
 
-The KVM control plane authenticates host agents with a shared secret. Before starting the service, configure `/etc/lm-kvm/config.json`:
+`/etc/lm-kvm/config.json` (mode 600) holds the agent-listener settings. The
+installer creates any missing value and keeps existing ones on a re-run:
 
 ```json
 {
-  "agent_secret": "replace-with-a-long-random-secret"
+  "agent_secret": "<64 hex characters, generated once>",
+  "agent_tls_cert": "/etc/lm-kvm/agent-tls.crt",
+  "agent_tls_key": "/etc/lm-kvm/agent-tls.key"
 }
 ```
 
-Ensure file permissions are restricted to the service user (`chmod 0600 /etc/lm-kvm/config.json`).
+The agent listener on `:8767` serves **TLS only** and **fails closed**: with no
+loadable cert/key it does not start (agents send `agent_secret` in their first
+frame). The installer makes a self-signed cert when none exists at those paths;
+put your own cert and key there, or point the two keys elsewhere (a re-run keeps
+them). An agent must authenticate within 10 seconds of connecting.
+
+Agent ids are claimed, not proven: every agent shares the one `agent_secret`, so
+anything holding it can connect under any id that is **not currently
+connected**. While an id's connection is open, a second connection with that id
+is refused (close code 1008, "agent_id in use") and logged as a WARNING with
+both peer addresses; once the old connection has closed, a reconnect takes its
+place. Pings every 20 s close a dead connection within about 40 s, so an agent
+whose old socket went half-open may be refused until then. Replies and log
+lines are accepted only from the connection a command was sent on. Per-agent
+credentials (or mTLS) are a planned follow-up; until then, treat the secret as
+granting control of every agent id.
 <!-- INSTALLERS:END -->
 
 ---
