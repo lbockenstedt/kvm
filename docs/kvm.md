@@ -75,19 +75,26 @@ Commands processed by `src/kvm_spoke.py`:
 | `CREATE_VM` | Hub → Spoke → Agent | Relays domain creation request to target agent; forces live query on next list. |
 | `DELETE_VM` | Hub → Spoke → Agent | Relays domain deletion/undefine request to target agent; forces live query on next list. |
 
+`GET_VM_INFO`, `CREATE_VM` and `DELETE_VM` need a connected `agent_id`, a `unique_id`/`vm_id` of `<hostname>/<domain>`, or a domain name plus `node`, matching exactly one agent. There is no first-agent fallback, and the agent receives the resolved domain name. With `proxmox_tag` the domain must carry the tag. Without it, `DELETE_VM` is admin-only and `CREATE_VM` needs admin or a tag. `GET_VM_INFO` is answered because the hub authorizes it from the returned `tags`; `vm_id: "all"` returns every agent's VMs. A failed mutation does not force a live query. VM lists and node stats report unreachable agents in `errors`. `GET_NODE_STATS` and the VM-list commands are answered by the kvm module, not the core Proxmox aggregator.
+
 ---
 
 ## Installation & Setup
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/lbockenstedt/kvm/main/install_kvm.sh \
-  | sudo bash -s -- --hub wss://lm-hub.example.com:443
+  | sudo bash -s -- --hub lm-hub.example.com [--id ID] [--secret S] [--hub-secret S]
 ```
 
-Ensure `/etc/lm-kvm/config.json` contains a shared `agent_secret` before starting the agent listener:
+A bare hostname becomes `wss://<host>:443`; `ws://` is refused. Secrets go only
+into `/opt/lm-kvm/.env` (mode 600) and reach the service through its environment.
+The installer also lays down the shared LM core in `/opt/lm-kvm/lm-core`.
 
-```json
-{
-  "agent_secret": "<shared-random-secret>"
-}
-```
+`/etc/lm-kvm/config.json` (mode 600) holds `agent_secret`, `agent_tls_cert` and
+`agent_tls_key`. The installer generates a missing secret and a self-signed cert
+once, and keeps existing values. The agent listener (`:8767`) is TLS-only and
+fails closed: without a loadable cert/key it does not start. All agents share
+`agent_secret`, so an agent id is claimed, not proven: a second connection for an
+id that is still connected is refused ("agent_id in use"), but any secret holder
+can take an id that is not connected. Pings (20 s interval and timeout) close
+dead connections. Per-agent credentials are a follow-up.

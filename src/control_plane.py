@@ -16,19 +16,20 @@ import logging
 import hmac
 import argparse
 import os
+# ssl wraps the agent listener in TLS (the agent secret travels in its first frame).
+import ssl
+import subprocess
 # Type hints only.
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-# Shared hub-link base class, message signer and message types; the import path
-# differs between the repo layout (core.src...) and the installed flat layout.
+# Shared hub-link base class and message signer; the import path differs
+# between the repo layout (core.src...) and the installed flat layout.
 try:
     from core.src.messaging.control_plane import BaseControlPlane
     from core.src.security.signer import MessageSigner
-    from core.src.messaging.protocol import Message, MessageHeader, MessagePayload
 except ImportError:
     from messaging.control_plane import BaseControlPlane
     from security.signer import MessageSigner
-    from messaging.protocol import Message, MessageHeader, MessagePayload
 
 # Shared logging setup + a canonical local file log (contract req 6 +
 # normalization). configure_logging gives the standard format + LOG_LEVEL env;
@@ -94,6 +95,75 @@ class KVMControlPlane(BaseControlPlane):
 
     # TCP port the local KVM agents connect to.
     AGENT_PORT = 8767
+    # Seconds an unauthenticated connection may take to send its auth frame.
+    AGENT_AUTH_TIMEOUT = 10.0
+    # WebSocket keepalive: a connection that misses a pong for PING_TIMEOUT
+    # seconds is closed, so a dead agent's agent_id is freed within about
+    # PING_INTERVAL + PING_TIMEOUT seconds (see the duplicate-id check).
+    AGENT_PING_INTERVAL = 20.0
+    AGENT_PING_TIMEOUT = 20.0
+
+    @staticmethod
+    def _repo_identity(url: str) -> str:
+        """Return ``host/owner/repo`` for a git URL (https, ssh or scp form),
+        lower-cased, without credentials, port or ``.git``; "" if unparseable.
+
+        The whole identity is compared, not just the repo name, so a
+        same-named fork on another owner or host is a different repository."""
+        text = (url or "").strip().rstrip("/")
+        # Drop the scheme, then any user[:token]@ credentials.
+        if "://" in text:
+            text = text.split("://", 1)[1]
+        text = text.rsplit("@", 1)[-1]
+        # scp form host:owner/repo, or host[:port]/owner/repo.
+        host, sep, path = text.partition("/")
+        if ":" in host:
+            host, _, rest = host.partition(":")
+            if not rest.isdigit():
+                path = rest + sep + path
+        path = path[:-4] if path.endswith(".git") else path
+        parts = [p for p in path.split("/") if p]
+        if not host or len(parts) < 2:
+            return ""
+        return "/".join([host] + parts).lower()
+
+    def _resolve_core_root(self) -> Optional[str]:
+        """The shared lm core this spoke imports: install_kvm.sh clones it to
+        ``<install dir>/lm-core`` (on PYTHONPATH), not the base class's
+        /opt/lm, so self-update and rollback must use that checkout."""
+        core = os.path.join(self._repo_root(), "lm-core")
+        return core if os.path.isdir(os.path.join(core, ".git")) else super()._resolve_core_root()
+
+    def _perform_self_update_sync(self, repo_url: str, core_repo_url: Optional[str] = None,
+                                  core_branch: Optional[str] = None,
+                                  reason: str = "update") -> Dict[str, Any]:
+        """Refuse an update that would repoint this checkout at another repository.
+
+        The hub picks the update source by module_type, and maps every
+        "hypervisor" to the pxmx repo (lm core/src/update_pipeline.py
+        _UPDATE_SOURCE_MODULE_KEY). The base updater runs
+        ``git remote set-url origin <repo_url>`` and pulls, which would replace
+        this kvm checkout with pxmx code. So the update runs only when the pushed
+        URL names the same repository (host, owner and name) as the current
+        origin; an unreadable origin is refused too (fail closed). Credentials
+        are stripped before anything is logged, as a URL may carry a token.
+        """
+        # Read the current origin of this checkout.
+        try:
+            origin = subprocess.run(["git", "remote", "get-url", "origin"], cwd=self._repo_root(),
+                                    capture_output=True, text=True, timeout=15).stdout
+        except Exception:
+            origin = ""
+        want, have = self._repo_identity(repo_url), self._repo_identity(origin)
+        # A different (or unknown) repository: refuse without touching git.
+        if not have or want != have:
+            logger.warning("SPOKE_UPDATE refused: pushed repo %r is not this checkout's repo %r",
+                           want or "?", have or "unknown")
+            return {"status": "ERROR",
+                    "message": f"update refused: repo {want or '?'} is not this checkout's repo "
+                               f"({have or 'unknown'}); set the kvm update source on the hub"}
+        return super()._perform_self_update_sync(repo_url, core_repo_url=core_repo_url,
+                                                 core_branch=core_branch, reason=reason)
 
     def get_service_name(self) -> str:
         """Return the systemd service name reported to the hub for health checks."""
@@ -132,26 +202,104 @@ class KVMControlPlane(BaseControlPlane):
 
         # Signer for agent messages, pending command futures and connected agent records.
         self.agent_signer = MessageSigner(self.agent_secret or "")
-        self.pending_responses: Dict[str, asyncio.Future] = {}
+        # Pending command futures keyed by correlation id, with the agent and
+        # the exact connection each command was sent on.
+        self.pending_responses: Dict[str, Tuple[str, Any, asyncio.Future]] = {}
         self.connected_agents: Dict[str, Dict[str, Any]] = {}
+        # Background closes of superseded agent sockets (kept so they aren't GC'd).
+        self._close_tasks: set = set()
+
+    # Hypervisor list commands the base control plane would answer with its
+    # Proxmox aggregator (pvesh over RUN_COMMAND). KVM agents speak libvirt, so
+    # these must reach the kvm module instead.
+    _MODULE_LIST_COMMANDS = frozenset(
+        {"GET_NODE_STATS", "PXMX_LIST_VMS", "GET_VM_LIST", "AGENT_GET_VM_LIST"})
+
+    async def handle_system_command(self, cmd_type: str, data: Dict[str, Any]) -> Any:
+        """Hand the hypervisor list commands to the kvm module; defer the rest to the base."""
+        # None tells the base dispatcher to route the command to the module.
+        if cmd_type in self._MODULE_LIST_COMMANDS:
+            return None
+        return await super().handle_system_command(cmd_type, data)
 
     # ── Agent WebSocket server ────────────────────────────────────────────────
 
+    def _agent_tls_context(self) -> Optional[ssl.SSLContext]:
+        """Build the agent listener's TLS context from config, or None when it can't.
+
+        Agents send the shared agent_secret in their first frame, so the
+        listener must never accept plaintext. The certificate and key paths
+        come from ``agent_tls_cert`` / ``agent_tls_key`` in the KVM config.
+        """
+        # Both paths are required; a missing one means no TLS.
+        cert = self.config.get("agent_tls_cert")
+        key = self.config.get("agent_tls_key")
+        if not cert or not key:
+            return None
+        # A bad or unreadable pair is logged and treated as no TLS.
+        try:
+            ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ctx.load_cert_chain(cert, key)
+            return ctx
+        except (OSError, ssl.SSLError) as e:
+            logger.error(f"KVM agent TLS cert/key could not be loaded: {e}")
+            return None
+
     async def run_agent_server(self):
-        """Listen for KVM agent connections on AGENT_PORT forever."""
-        # Serve agents on all interfaces; each connection is handled by _agent_handler.
-        async with websockets.serve(self._agent_handler, "0.0.0.0", self.AGENT_PORT):
-            logger.info(f"KVM agent listener on :{self.AGENT_PORT}")
+        """Listen for KVM agent connections on AGENT_PORT over TLS forever.
+
+        Fails closed: with no usable TLS certificate the listener is not
+        started at all, because a plaintext listener would expose the shared
+        agent secret to anyone on the network.
+        """
+        # No TLS context: refuse to listen rather than serve plaintext.
+        ssl_ctx = self._agent_tls_context()
+        if ssl_ctx is None:
+            logger.error("KVM agent listener NOT started: set agent_tls_cert and "
+                         "agent_tls_key in /etc/lm-kvm/config.json (fail-closed)")
+            return
+        # Serve agents on all interfaces over TLS; each connection is handled by _agent_handler.
+        async with websockets.serve(self._agent_handler, "0.0.0.0", self.AGENT_PORT, ssl=ssl_ctx,
+                                    ping_interval=self.AGENT_PING_INTERVAL,
+                                    ping_timeout=self.AGENT_PING_TIMEOUT):
+            logger.info(f"KVM agent listener on :{self.AGENT_PORT} (TLS)")
             # Await a future that never completes so the server runs until cancelled.
             await asyncio.Future()
+
+    def _owns_record(self, agent_id: str, websocket) -> bool:
+        """True when the agent's current record belongs to this connection.
+
+        After a reconnect the old connection must not refresh, overwrite or
+        delete the newer connection's record.
+        """
+        rec = self.connected_agents.get(agent_id)
+        return rec is not None and rec.get("ws") is websocket
+
+    @staticmethod
+    def _is_open(ws) -> bool:
+        """True while a socket's WebSocket state is OPEN (websockets' State enum).
+
+        A socket that is closing or closed (or an object with no state) is
+        not open, so its agent_id may be taken by a new connection."""
+        return getattr(getattr(ws, "state", None), "name", None) == "OPEN"
+
+    @staticmethod
+    async def _close_replaced(ws) -> None:
+        """Best-effort close of a connection superseded by a reconnect."""
+        try:
+            await ws.close(1000, "Replaced by a newer connection")
+        except Exception:  # noqa: BLE001 — the old socket may already be gone
+            pass
 
     async def _agent_handler(self, websocket, path=None):
         """Authenticate one agent connection, then process its messages until it closes."""
         # Unknown until the agent introduces itself.
         agent_id = None
         try:
-            # The first message must carry the agent id and shared secret.
-            auth = json.loads(await websocket.recv())
+            # The first message must carry the agent id and shared secret, and
+            # must arrive promptly so idle unauthenticated sockets can't pile up.
+            auth = json.loads(await asyncio.wait_for(websocket.recv(),
+                                                     timeout=self.AGENT_AUTH_TIMEOUT))
             agent_id     = auth.get("agent_id")
             agent_secret = auth.get("secret")
 
@@ -170,7 +318,23 @@ class KVMControlPlane(BaseControlPlane):
             if ack.get("status") != "HUB_OK":
                 await websocket.close(1008, "Mutual auth failed"); return
 
+            # Refuse an agent_id whose current connection is still open. Every
+            # agent shares one agent_secret and names itself, so without this
+            # any agent holding the secret could claim a live host's id, take
+            # its commands and answer them. A dead connection is closed by the
+            # ping timeout (AGENT_PING_*), which frees the id for the real
+            # agent's reconnect. No await between this check and the
+            # registration below, so two handshakes can't both pass it.
+            old = self.connected_agents.get(agent_id)
+            if old and old.get("ws") is not websocket and self._is_open(old.get("ws")):
+                logger.warning(f"KVM agent '{agent_id}' refused: that agent_id is already "
+                               f"connected from {getattr(old.get('ws'), 'remote_address', None)} "
+                               f"(new peer {getattr(websocket, 'remote_address', None)})")
+                await websocket.close(1008, "agent_id in use"); return
+
             # Register the agent with empty telemetry until its first report arrives.
+            # A record left by a closing connection is replaced; close that old
+            # socket so its handler ends instead of lingering as a second session.
             logger.info(f"KVM agent '{agent_id}' connected")
             self.connected_agents[agent_id] = {
                 "ws":           websocket,
@@ -180,6 +344,12 @@ class KVMControlPlane(BaseControlPlane):
                 "vms":          [],
                 "agent_metrics": {},
             }
+            if old and old.get("ws") is not websocket:
+                # Close in the background: a half-open old peer can hold close()
+                # for websockets' close_timeout, and the new agent must not wait.
+                task = asyncio.create_task(self._close_replaced(old["ws"]))
+                self._close_tasks.add(task)
+                task.add_done_callback(self._close_tasks.discard)
 
             # Process every message the agent sends.
             async for raw in websocket:
@@ -196,12 +366,12 @@ class KVMControlPlane(BaseControlPlane):
 
                 # Heartbeat: just refresh the last-seen time.
                 if msg_type == "AGENT_HEARTBEAT":
-                    if agent_id in self.connected_agents:
+                    if self._owns_record(agent_id, websocket):
                         self.connected_agents[agent_id]["last_seen"] = time.time()
 
                 # Telemetry: refresh last-seen and store the host's nodes, VMs and metrics.
                 elif msg_type == "AGENT_TELEMETRY":
-                    if agent_id in self.connected_agents:
+                    if self._owns_record(agent_id, websocket):
                         rec = self.connected_agents[agent_id]
                         rec["last_seen"]    = time.time()
                         rec["hostname"]     = data.get("hostname", agent_id)
@@ -209,67 +379,94 @@ class KVMControlPlane(BaseControlPlane):
                         rec["vms"]          = data.get("vms",   {}).get("vms",   [])
                         rec["agent_metrics"] = data.get("metrics", {})
 
-                # Response to a command: resolve the waiting future with its data.
+                # Response to a command: resolve the waiting future with its data,
+                # but only when this agent is the one the command was sent to, so
+                # one agent can't answer (or forge the result of) another's command.
                 elif msg_type == "AGENT_RESPONSE":
-                    if corr_id in self.pending_responses:
-                        fut = self.pending_responses.pop(corr_id)
-                        if not fut.done():
-                            fut.set_result(data)
+                    pending = self.pending_responses.get(corr_id)
+                    if pending is None:
+                        continue
+                    target, target_ws, fut = pending
+                    if target != agent_id or target_ws is not websocket:
+                        logger.warning(f"Agent '{agent_id}' answered a command sent to "
+                                       f"'{target}' on another connection — dropping")
+                        continue
+                    del self.pending_responses[corr_id]
+                    if not fut.done():
+                        fut.set_result(data)
 
-                # Log line: wrap it and relay it up to the hub.
+                # Log line: relay it up to the hub in the AGENT_RELAY_UP shape the
+                # hub reads (original_payload.payload), without the agent's signature.
+                # send_to_hub(type, data) is best-effort and never raises.
                 elif msg_type == "AGENT_LOG":
-                    relay = Message(
-                        header=MessageHeader(message_id=str(uuid.uuid4()), timestamp=time.time(),
-                                            sender_id=self.spoke_id, destination_id="hub"),
-                        payload=MessagePayload(type="AGENT_RELAY_UP",
-                                               data={"agent_id": agent_id, "original_payload": msg}))
-                    await self.send_to_hub(relay)
+                    # A superseded connection's lines are not relayed as this agent's.
+                    if not self._owns_record(agent_id, websocket):
+                        continue
+                    await self.send_to_hub("AGENT_RELAY_UP", {
+                        "agent_id": agent_id,
+                        "hostname": self.connected_agents.get(agent_id, {}).get("hostname", agent_id),
+                        "original_payload": {"payload": {"type": "AGENT_LOG", "data": data}},
+                    })
 
-        # Any error ends this connection; log it with the traceback.
+        # A silent socket (a scanner, a stalled client) just times out: warn
+        # without a traceback so port scans don't flood the log.
+        except asyncio.TimeoutError:
+            logger.warning(f"KVM agent connection timed out during authentication "
+                           f"(agent '{agent_id or 'unknown'}')")
+        # Any other error ends this connection; log it with the traceback.
         except Exception as e:
             logger.error(f"KVM agent handler error: {e}", exc_info=True)
-        # Always forget the agent once its connection ends.
+        # Forget the agent once its connection ends, but only if the record is
+        # still this connection's: a reconnect may already have replaced it, and
+        # deleting that would drop the live session.
         finally:
-            if agent_id and agent_id in self.connected_agents:
+            if agent_id and self._owns_record(agent_id, websocket):
                 del self.connected_agents[agent_id]
+            # Fail this connection's outstanding commands now rather than at
+            # their timeout; no other connection may answer them.
+            for cid, (_, pws, pfut) in list(self.pending_responses.items()):
+                if pws is websocket:
+                    del self.pending_responses[cid]
+                    if not pfut.done():
+                        pfut.set_result({"status": "ERROR", "message": "Agent disconnected"})
             logger.info(f"KVM agent '{agent_id}' disconnected")
 
     # ── Agent command routing ─────────────────────────────────────────────────
 
     async def send_to_agent(self, cmd_type: str, data: Dict[str, Any],
-                            agent_id: Optional[str] = None) -> Dict[str, Any]:
-        """Send a command to one agent (or the first connected one) and await its reply.
+                            agent_id: Optional[str] = None,
+                            timeout: float = 15.0) -> Dict[str, Any]:
+        """Send a command to one connected agent and await its reply.
+
+        An agent must be named: with several hypervisors, picking "the first
+        one" could run a command on the wrong host.
 
         Returns:
             The agent's response data, or an ERROR dict on missing agent/timeout/failure.
         """
-        # A specific agent was requested: it must be connected.
-        if agent_id:
-            rec = self.connected_agents.get(agent_id)
-            if not rec:
-                return {"status": "ERROR", "message": f"Agent '{agent_id}' not connected"}
-            ws = rec["ws"]
-        else:
-            # No agent named: use the first connected one, if any.
-            if not self.connected_agents:
-                return {"status": "ERROR", "message": "No KVM agents connected"}
-            ws = next(iter(self.connected_agents.values()))["ws"]
+        # The named agent must be connected.
+        if not agent_id:
+            return {"status": "ERROR", "message": "No KVM agent specified"}
+        rec = self.connected_agents.get(agent_id)
+        if not rec:
+            return {"status": "ERROR", "message": f"Agent '{agent_id}' not connected"}
+        ws = rec["ws"]
 
         # Build the command message with a fresh correlation id and sign it.
         corr_id = str(uuid.uuid4())
         msg = {
             "header": {"message_id": corr_id, "timestamp": time.time(),
-                       "sender_id": self.spoke_id, "destination_id": agent_id or "kvm-agent"},
+                       "sender_id": self.spoke_id, "destination_id": agent_id},
             "payload": {"type": cmd_type, "data": data},
         }
         msg["signature"] = self.agent_signer.sign(msg)
-        # Register a future that _agent_handler resolves when the reply arrives.
+        # Register a future that _agent_handler resolves when this agent replies.
         fut = asyncio.get_running_loop().create_future()
-        self.pending_responses[corr_id] = fut
-        # Send the command and wait up to 15s for the reply.
+        self.pending_responses[corr_id] = (agent_id, ws, fut)
+        # Send the command and wait for the reply.
         try:
             await ws.send(json.dumps(msg, separators=(',', ':')))
-            return await asyncio.wait_for(fut, timeout=15.0)
+            return await asyncio.wait_for(fut, timeout=timeout)
         # No reply in time: forget the future and report a timeout.
         except asyncio.TimeoutError:
             self.pending_responses.pop(corr_id, None)
@@ -281,18 +478,20 @@ class KVMControlPlane(BaseControlPlane):
 
     async def broadcast_to_agents(self, cmd_type: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Send a command to every connected agent in parallel and collect the replies."""
-        # No agents means no replies.
-        if not self.connected_agents:
+        # Snapshot the agent ids so replies pair with the agents actually asked,
+        # even if one connects or disconnects during the gather.
+        agent_ids = list(self.connected_agents)
+        if not agent_ids:
             return []
         # Run all sends concurrently; exceptions are returned instead of raised.
         results = await asyncio.gather(
-            *[self.send_to_agent(cmd_type, data, aid) for aid in list(self.connected_agents)],
+            *[self.send_to_agent(cmd_type, data, aid) for aid in agent_ids],
             return_exceptions=True,
         )
         # Pair each reply with its agent id, turning exceptions into ERROR entries.
         return [
             {"agent_id": aid, **(res if not isinstance(res, Exception) else {"status": "ERROR", "message": str(res)})}
-            for aid, res in zip(self.connected_agents, results)
+            for aid, res in zip(agent_ids, results)
         ]
 
     # ── Spoke startup ─────────────────────────────────────────────────────────
@@ -301,7 +500,8 @@ class KVMControlPlane(BaseControlPlane):
         """Start the agent listener, register the KVM module and run the hub link."""
         # Announce the hub target and start the agent server in the background.
         logger.info(f"Starting KVM spoke → {self.hub_url}")
-        asyncio.create_task(self.run_agent_server())
+        # Keep a reference so the listener task isn't garbage-collected mid-run.
+        self._agent_server_task = asyncio.create_task(self.run_agent_server())
 
         # Imported here to avoid a circular import; the spoke needs this control plane.
         from kvm_spoke import KVMSpoke
@@ -315,9 +515,11 @@ class KVMControlPlane(BaseControlPlane):
 if __name__ == "__main__":
     # Command-line flags: spoke identity, secrets and the (required) hub URL.
     parser = argparse.ArgumentParser()
+    # Secrets default to the environment (the unit's EnvironmentFile) so they
+    # never appear on the command line, where any local user can read them.
     parser.add_argument("--id",         required=True)
-    parser.add_argument("--secret",     required=True)
-    parser.add_argument("--hub-secret", default="")
+    parser.add_argument("--secret",     default=os.environ.get("SPOKE_SECRET", ""))
+    parser.add_argument("--hub-secret", default=os.environ.get("HUB_SECRET", ""))
     parser.add_argument("--hub",        required=True)
     # Read the flags the user passed.
     args = parser.parse_args()

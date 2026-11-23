@@ -15,3 +15,7 @@ certs/
 keys.json
 hub_secret.json
 secrets.json
+
+# Runtime logs (control_plane falls back to src/logs/ when /var/log/lm is not writable)
+logs/
+*.log
