@@ -8,7 +8,7 @@ agents through the KVM control plane and normalising their VM records.
 import logging
 import time
 # Type hints only.
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 # Shared spoke base class; the import path differs between flat and repo layouts.
 try:
@@ -144,7 +144,7 @@ class KVMSpoke(BaseSpoke):
             return await self._get_node_stats(data)
 
         # VM listing (both the Proxmox-compatible and generic command names).
-        if cmd in ("PXMX_LIST_VMS", "GET_VM_LIST"):
+        if cmd in ("PXMX_LIST_VMS", "GET_VM_LIST", "AGENT_GET_VM_LIST"):
             return await self._list_vms(data)
 
         # SEARCH_VMS: tenant-scoped VM search.
@@ -187,12 +187,21 @@ class KVMSpoke(BaseSpoke):
         # Ask every agent for its node stats in parallel.
         results = await self.control_plane.broadcast_to_agents("GET_NODE_STATS", {})
         # Flatten the per-agent node lists, tagging each node with its agent id.
+        # An agent that failed is listed in "errors" rather than silently
+        # looking like a host with no nodes.
         nodes: List[Dict] = []
+        errors: List[Dict] = []
         for res in results:
+            if res.get("status") == "ERROR":
+                errors.append({"agent_id": res.get("agent_id", ""), "message": res.get("message", "")})
+                continue
             for node in res.get("nodes", []):
                 nodes.append({**node, "agent_id": res.get("agent_id", "")})
-        # Return the combined node list.
-        return {"status": "SUCCESS", "nodes": nodes}
+        # Return the combined node list, plus any per-agent failures.
+        out: Dict[str, Any] = {"status": "SUCCESS", "nodes": nodes}
+        if errors:
+            out["errors"] = errors
+        return out
 
     @staticmethod
     def _shape_vm(vm: Dict[str, Any], aid: str, hostname: str) -> Dict[str, Any]:
@@ -244,15 +253,20 @@ class KVMSpoke(BaseSpoke):
                 stale_agents.append(aid)
 
         # Live-query the stale / forced agents individually and merge.
+        errors: List[Dict] = []
         for aid in stale_agents:
             # Look up the agent's hostname for shaping its VMs.
             info = self.control_plane.connected_agents.get(aid, {})
             hostname = info.get("hostname", aid)
-            # Ask the agent directly; skip it (with a warning) if the request fails.
+            # Ask the agent directly. send_to_agent reports failures as an ERROR
+            # dict; record them so a dead agent isn't shown as "no VMs".
             try:
                 res = await self.control_plane.send_to_agent("GET_VM_LIST", {}, agent_id=aid)
             except Exception as e:
-                logger.warning("Live VM query to agent %s failed: %s", aid, e)
+                res = {"status": "ERROR", "message": str(e)}
+            if res.get("status") == "ERROR":
+                logger.warning("Live VM query to agent %s failed: %s", aid, res.get("message"))
+                errors.append({"agent_id": aid, "message": res.get("message", "")})
                 continue
             # Add the live VMs in the canonical shape.
             for vm in res.get("vms", []):
@@ -265,8 +279,11 @@ class KVMSpoke(BaseSpoke):
 
         # Report where the data came from along with the VMs.
         source = "live_query" if stale_agents else "telemetry_cache"
-        return {"status": "SUCCESS", "vms": vms, "source": source,
-                "agent_count": len(self.control_plane.connected_agents)}
+        out: Dict[str, Any] = {"status": "SUCCESS", "vms": vms, "source": source,
+                               "agent_count": len(self.control_plane.connected_agents)}
+        if errors:
+            out["errors"] = errors
+        return out
 
     async def _search_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Search KVM guest domains by name, hostname, unique ID, IP, or MAC."""
@@ -328,43 +345,95 @@ class KVMSpoke(BaseSpoke):
             logger.exception("SEARCH_VMS failed")
             return {"status": "ERROR", "message": str(e), "results": []}
 
-    async def _get_vm_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Fetch detailed runtime and XML configuration for a specific VM domain."""
+    def _vm_target(self, data: Dict[str, Any]) -> Tuple[Optional[str], str]:
+        """Return (agent id, domain name) for a single-VM command, or (None, name).
+
+        The hub names a VM by ``unique_id`` or ``vm_id`` ("<hostname>/<domain>",
+        see _shape_vm), optionally with ``node`` (the hostname) and ``agent_id``.
+        The host comes from ``agent_id``, else the id's hostname part, else
+        ``node``; it must match exactly one connected agent. There is never a
+        "first agent" fallback: with several hypervisors that would act on the
+        wrong host.
+        """
+        # Split "<hostname>/<domain>"; a bare id is the domain name itself.
+        agents = self.control_plane.connected_agents
+        ref = str(data.get("unique_id") or data.get("vm_id") or "")
+        host, sep, domain = ref.partition("/")
+        name = domain if sep else str(data.get("name") or ref)
+        host = host if sep else str(data.get("node") or "")
+        # An explicit agent id must be connected and agree with the named host.
+        aid = data.get("agent_id")
+        if aid:
+            info = agents.get(aid)
+            if info is None or (host and info.get("hostname", aid) != host):
+                return None, name
+            return aid, name
+        # Otherwise the hostname must match exactly one agent.
+        matches = [a for a, info in agents.items() if host and info.get("hostname", a) == host]
+        return (matches[0] if len(matches) == 1 else None), name
+
+    def _tenant_allows(self, data: Dict[str, Any], agent_id: str, name: str,
+                       hub_authorizes: bool) -> bool:
+        """Apply the SEARCH_VMS tenant rule to a single-VM command.
+
+        Tenant tag sent: the domain on that agent must carry the tag (an
+        unknown domain is refused). No tag: an admin may act. A read the hub
+        authorizes itself also passes: the hub's GET_VM_INFO callers
+        (lm routes/pxmx.py VM detail and console/control gates) send no tenant
+        fields and decide ownership from the tags this reply returns.
+        """
+        # Read the tenant scope the hub sent with the command.
+        tenant_tag = (data.get("proxmox_tag") or "").strip().lower()
+        if not tenant_tag:
+            return bool(data.get("is_admin")) or hub_authorizes
+        # Find the domain in the agent's telemetry and check its tags.
+        info = self.control_plane.connected_agents.get(agent_id, {})
+        for vm in info.get("vms", []):
+            if vm.get("name") == name:
+                return tenant_tag in [str(t).lower() for t in (vm.get("tags") or [])]
+        return False
+
+    async def _relay_vm_command(self, cmd: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Send one VM command to the agent that hosts it, after the target and scope checks."""
         # Commands need the control plane to reach agents.
         if not self.control_plane:
             return {"status": "ERROR", "message": "No control plane"}
-        # Use the requested agent, or the first connected one.
-        agent_id = data.get("agent_id")
-        if not agent_id and self.control_plane.connected_agents:
-            agent_id = next(iter(self.control_plane.connected_agents))
-        # No agent available to ask.
+        # The target agent must be identified unambiguously.
+        agent_id, name = self._vm_target(data)
         if not agent_id:
-            return {"status": "ERROR", "message": "No agents connected"}
-        # Relay the request and return the agent's reply.
-        return await self.control_plane.send_to_agent("GET_VM_INFO", data, agent_id=agent_id)
+            return {"status": "ERROR", "message": "Target KVM agent not found: pass a "
+                    "connected agent_id, a unique_id/vm_id of <hostname>/<domain>, or node"}
+        # A new VM may only be created by an admin or with the caller's tenant tag.
+        if cmd == "CREATE_VM":
+            if not (data.get("is_admin") or (data.get("proxmox_tag") or "").strip()):
+                return {"status": "ERROR", "message": "Not permitted"}
+        # Existing VMs are tenant-checked against the agent's telemetry.
+        elif not self._tenant_allows(data, agent_id, name, hub_authorizes=cmd == "GET_VM_INFO"):
+            return {"status": "ERROR", "message": "VM not found"}
+        # Relay with the resolved domain name, so the agent acts on the VM that was checked.
+        return await self.control_plane.send_to_agent(cmd, {**data, "name": name}, agent_id=agent_id)
+
+    async def _get_vm_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch detailed runtime and XML configuration for one VM, or every VM for "all"."""
+        # The hub's admin inventory asks for vm_id "all": answer with every agent's VMs.
+        if data.get("vm_id") == "all":
+            return await self._list_vms(data)
+        return await self._relay_vm_command("GET_VM_INFO", data)
 
     async def _create_vm(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Relay VM domain creation command to target KVM agent."""
-        # Commands need at least one connected agent.
-        if not self.control_plane or not self.control_plane.connected_agents:
-            return {"status": "ERROR", "message": "No agents connected"}
-        # Use the requested agent, or the first connected one, and relay the create.
-        agent_id = data.get("agent_id") or next(iter(self.control_plane.connected_agents))
-        result = await self.control_plane.send_to_agent("CREATE_VM", data, agent_id=agent_id)
-        # Cache is now stale for this mutation — force the next list to live-query.
-        self._force_live_query = True
+        """Relay VM domain creation command to the target KVM agent."""
+        result = await self._relay_vm_command("CREATE_VM", data)
+        # Only a successful mutation makes the cache stale; force the next list to live-query.
+        if result.get("status") != "ERROR":
+            self._force_live_query = True
         return result
 
     async def _delete_vm(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Relay VM domain destruction/undefinition command to target KVM agent."""
-        # Commands need at least one connected agent.
-        if not self.control_plane or not self.control_plane.connected_agents:
-            return {"status": "ERROR", "message": "No agents connected"}
-        # Use the requested agent, or the first connected one, and relay the delete.
-        agent_id = data.get("agent_id") or next(iter(self.control_plane.connected_agents))
-        result = await self.control_plane.send_to_agent("DELETE_VM", data, agent_id=agent_id)
-        # Cache is now stale for this mutation — force the next list to live-query.
-        self._force_live_query = True
+        """Relay VM domain destruction/undefinition command to the target KVM agent."""
+        result = await self._relay_vm_command("DELETE_VM", data)
+        # Only a successful mutation makes the cache stale; force the next list to live-query.
+        if result.get("status") != "ERROR":
+            self._force_live_query = True
         return result
 
     async def get_status(self) -> Dict[str, Any]:
