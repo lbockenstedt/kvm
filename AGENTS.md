@@ -24,11 +24,11 @@ copy also lives in this repo's `docs/` — before making structural changes.
 ## kvm-specific gotchas
 
 - **Earliest-stage repo in the fleet** (`VERSION 0.03`) — thin compared to its siblings, and there is no dedicated `lm/docs/kvm.md` yet. Expect gaps.
-- **Shares `module_type = "hypervisor"` with `pxmx`.** Cross-check hub-side hypervisor handling before changing anything the hub dispatches on.
-- **`--hub` needs a full `ws://`/`wss://` URL here** — unlike most module installers, this one does **not** normalise a bare hostname.
+- **Shares `module_type = "hypervisor"` with `pxmx`.** Cross-check hub-side hypervisor handling before changing anything the hub dispatches on. The hub maps "hypervisor" to the pxmx update source, so the control plane refuses a SPOKE_UPDATE whose repo is not its own origin's (`_perform_self_update_sync`); hub-driven kvm updates need a kvm-aware update source in lm.
+- **`--hub`** takes a bare hostname (normalised to `wss://<host>:443`) or a `wss://` URL; `ws://` is refused.
 - `--admin-token` is deprecated: accepted and ignored.
-- The control plane authenticates agents with a shared secret and **fails closed** — see the README's "Required control-plane config".
-- No `docs/` or `tests/` directory yet.
+- The control plane authenticates agents with a shared secret over a **TLS-only** listener and **fails closed** (no secret or no cert: no agents) — see the README's "Control Plane Configuration". The secret is shared by all agents, so agent ids are self-asserted: a live id can't be taken over (a duplicate connection is refused), but a disconnected one can.
+- Tests live in `tests/` (run `python -m pytest -q tests`); module docs in `docs/`.
 
 <!-- fleet-rules:begin (synced from lm/.github/fleet-rules.md -- edit there) -->
 
@@ -170,6 +170,31 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    added mid-review each brought new findings, so it took 16 rounds.
    Separately, one request turned into about ten changes, five of them a
    chain of follow-ups.
+10. **Cloud AI is scarce: local models first, and a daily spend gate.**
+    - Use local or free models (the `local-*` agents, `ollama/*` and
+      `llamacpp/*` models) for every task they can do, even when they are
+      slower.
+    - Before using a cloud model or starting a cloud sub-agent, check
+      today's spend (`python3 .github/hooks/ai_budget.py status`) and
+      confirm that no local option fits.
+    - The daily gate stops runaway sessions; it is not a budget. At about
+      $100 of cloud AI in a local day, Copilot CLI refuses new work (cloud
+      sub-agents, workflows, agent messages and `copilot -p` runs), and AB
+      stops calling Copilot. Work already running finishes, so it need not
+      be retried. $25 past the gate, Copilot CLI refuses every tool call of
+      a session that used a cloud model that day, to stop a runaway. A
+      session on local models only keeps working. In the last $25 before
+      the gate, new cloud sub-agents are refused. The numbers are in
+      `.github/ai-budget.json`.
+    - The main session tracks the gate: it checks the spend before it
+      dispatches work, starts nothing new once the gate is closed, lets
+      work in flight finish, then stops and tells the user.
+    - Only a person reopens the gate: `ai_budget.py continue`, or Continue
+      in AB. An agent that meets the gate stops and tells the user; it never
+      reopens the gate, changes its state or works around it.
+
+    Why: in November 2026 review panels and max-effort sub-agents ran up
+    more than $1,500 of cloud AI a day, and nothing stopped them.
 
 ## 2. Git, branches and promotion
 
@@ -198,6 +223,7 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    - this file;
    - `.github/agents/`;
    - `.claude/skills/`;
+   - `.github/hooks/` and `.github/ai-budget.json` (the AI spend gate);
    - the `*-reusable.yml` workflows.
 
    Copies in other repos are overwritten by the sync. A repo's own agent is
@@ -263,7 +289,9 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    ORM, YAML, XML or CSV storage, locally or on the hub. A JSON variant such
    as JSON Lines is acceptable only for a real performance or reliability
    gain. Large state is split into one file per tenant, and written less
-   often.
+   often. Reading another tool's SQLite file, writing nothing to it, is
+   allowed: mark the import `# read-only` and open the file with `mode=ro`
+   (the AI spend gate reads Copilot CLI's usage log this way).
 2. **The hub keeps no long-term data.** Local data is a cache; long-term
    reporting belongs to the downstream system.
 3. **Caching contract** (`lm/docs/caching-contract.md`):
@@ -515,6 +543,7 @@ reviewers and the AB panel.
 | `check-direction` (branch flow), VERSION guard | `branch-flow` / `promote.yml` | 2.1, 2.2 |
 | PR intent statement | AB review panel | 2.4 |
 | Call-rate and NetBox churn health check (writes per hour, flapping fields, commands called far above their refresh interval) | AB hub health check | 4.8 |
+| AI spend gate (`.github/hooks/ai_budget.py`: past the daily gate, refuses new work (cloud sub-agents, workflows, agent messages, `copilot -p`); $25 past it, refuses every tool call of sessions that used a cloud model today; near it, refuses cloud sub-agents; always refuses an agent's reopen) | Copilot CLI hooks (`.github/hooks/fleet-hooks.json`) in a trusted folder; AB's LLM client | 1.10 |
 
 See `lm/docs/ci-checks.md` for what each check does and how to run it
 locally.
